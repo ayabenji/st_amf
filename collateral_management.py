@@ -90,7 +90,7 @@ def _load_collateral_inputs(config: CollateralConfig) -> pd.DataFrame:
             "seuil",
             "threshold",
         },
-        config.cash_col: {"cash_disponible", "cash disponible", "cash","cash_eur_db"},
+        config.cash_col: {"cash_disponible"},
     }
 
     normalised = {_normalise_column_name(col): col for col in inputs.columns}
@@ -136,7 +136,7 @@ def process_pv_after_day_1(
         "Equity Index Future",
         "FX Future",
     ),
-    cash_identifier: str = "CASH_EUR_DB",
+    cash_identifier: str = "CSH_EUR_DB",
     config: CollateralConfig | None = None,
     history_date: str | pd.Timestamp | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -203,7 +203,7 @@ def process_pv_after_day_1(
         new_row.update({"Identifier": cash_identifier, "AssetClass": "Cash", "TV": total_futures_tv})
         df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
         cash_mask = df["Identifier"] == cash_identifier
-    
+        print(df.loc[cash_mask,'TV'])
 
     if futures_mask.any():
         futures_mask = df["AssetClass"].isin(tuple(future_classes))
@@ -224,7 +224,13 @@ def process_pv_after_day_1(
         .sort_values(group_cols)
     )
 
-    cash_port_tv = df.loc[cash_mask].groupby(config.portfolio_col,dropna= True)['TV'].sum()
+    cash_port_tv = (df.loc[df["Identifier"] == cash_identifier]
+                    .groupby(config.portfolio_col,dropna= True)['TV']
+                    .sum()
+                    .reset_index(name=config.cash_col))
+    
+    print(cash_port_tv)
+
 
     balances = cp_port_tv.rename(columns={"TV_before_collat": "Balance_J"})
     inputs = _load_collateral_inputs(config)
@@ -239,6 +245,8 @@ def process_pv_after_day_1(
         on=[config.portfolio_col, config.counterparty_col],
         how="outer",
     )
+
+    merged = merged.merge(cash_port_tv, on=config.portfolio_col, how="left")
 
     merged["Balance_J"] = merged["Balance_J"].fillna(0.0)
     merged[config.balance_prev_col] = merged[config.balance_prev_col].fillna(0.0)
@@ -398,8 +406,7 @@ def roll_balance_for_next_day(
     inputs = _load_collateral_inputs(config)
 
     update_cols = [config.portfolio_col, config.counterparty_col, "Balance_J"]
-    if "Cash_restant" in processed_collateral.columns:
-        update_cols.append("Cash_restant")
+
     updates = processed_collateral[update_cols].copy()
 
     refreshed = inputs.merge(
@@ -411,10 +418,7 @@ def roll_balance_for_next_day(
     refreshed[config.balance_prev_col] = refreshed["Balance_J_new"].combine_first(
         refreshed.get(config.balance_prev_col, pd.Series(dtype=float))
     )
-    if "Cash_restant_new" in refreshed.columns:
-        refreshed[config.cash_col] = refreshed["Cash_restant_new"].combine_first(
-            refreshed.get(config.cash_col, pd.Series(dtype=float))
-        )
+
     refreshed = refreshed.drop(columns=[col for col in refreshed.columns if col.endswith("_new")])
 
     refreshed.to_excel(config.collateral_input_path, index=False)
