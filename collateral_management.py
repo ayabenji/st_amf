@@ -25,12 +25,13 @@ import pandas as pd
 class CollateralConfig:
     """Configuration of collateral related resources and column names."""
 
-    collateral_input_path: Path = Path(r"C:\Users\abenjelloun\OneDrive - Cooperactions\GAM-E-Risk Perf - RMP\1.PROD\1.REGLEMENTAIRE\14.Stress Test AMF (JB)\Production\Collat_Cash_MTM_LU_20250401.csv")
+    collateral_input_path: Path = Path(r"C:\Users\abenjelloun\OneDrive - Cooperactions\GAM-E-Risk Perf - RMP\1.PROD\1.REGLEMENTAIRE\14.Stress Test AMF (JB)\Production\Périmètre et positions\Collat_Cash_MTM_LU_20250401.csv")
+
     collateral_history_path: Path = Path("collateral_history.xlsx")
     counterparty_col: str = "Counterparty"
     portfolio_col: str = "Portfolio"
     balance_prev_col: str = "Balance_J_1"
-    threshold_col: str = "Seuil Déclenchement"
+    threshold_col: str = "Seuil declenchement"
     cash_col: str = "Cash_disponible"
 
     def ensure_directories(self) -> None:
@@ -67,7 +68,7 @@ def _load_collateral_inputs(config: CollateralConfig) -> pd.DataFrame:
 
     path = config.collateral_input_path
     if path.exists():
-        inputs = pd.read_excel(path)
+        inputs = pd.read_csv(path, sep=';',decimal=',',encoding='latin1')
     else:
         inputs = pd.DataFrame(
             columns=[
@@ -277,24 +278,85 @@ def process_pv_after_day_1(
     merged["Alerte"] = pd.Series([np.nan] * len(merged), dtype="object")
 
     groupama_mask = (~merged["Seuil_respecte"]) & (merged["Variation"] < 0)
-    if groupama_mask.any():
-        required = -merged.loc[groupama_mask, "Variation"]
-        available = merged.loc[groupama_mask, config.cash_col]
-        cash_used = np.minimum(required, available)
-        merged.loc[groupama_mask, "Cash_utilise"] = cash_used
-        merged.loc[groupama_mask, "Cash_restant"] = available - cash_used
+    total_cash_used_by_portfolio: dict[object, float] = {}
 
-        shortfall = required - cash_used
-        shortfall_positive = shortfall[shortfall > 0]
-        if not shortfall_positive.empty:
-            merged.loc[shortfall_positive.index, "Alerte"] = shortfall_positive.map(_format_alert)
+    for portfolio, portfolio_df in merged.groupby(config.portfolio_col, dropna=False):
+        if portfolio_df.empty:
+            continue
 
-        total_cash_used = float(cash_used.sum())
-        if total_cash_used and cash_mask.any():
-            df.loc[cash_mask, "TV"] = df.loc[cash_mask, "TV"].fillna(0.0) - total_cash_used
+        portfolio_cash = portfolio_df[config.cash_col].iloc[0]
+        if not np.isfinite(portfolio_cash):
+            portfolio_cash = 0.0
+        cash_pool = float(portfolio_cash)
+        initial_cash = cash_pool
+        total_used = 0.0
 
-    merged.loc[merged["Seuil_respecte"], "Cash_utilise"] = 0.0
-    merged.loc[merged["Seuil_respecte"], "Cash_restant"] = merged.loc[merged["Seuil_respecte"], "Cash_initial"]
+        needs_cash = groupama_mask.loc[portfolio_df.index].any()
+        if not needs_cash:
+            merged.loc[portfolio_df.index, "Cash_restant"] = cash_pool
+            continue
+
+        for idx in portfolio_df.index:
+            variation = merged.at[idx, "Variation"]
+            if pd.isna(variation) or merged.at[idx, "Seuil_respecte"] or variation >= 0:
+                merged.at[idx, "Cash_utilise"] = 0.0
+                merged.at[idx, "Cash_restant"] = cash_pool
+                continue
+
+            required = -variation
+            cash_used = min(required, cash_pool)
+
+            merged.at[idx, "Cash_utilise"] = cash_used
+            cash_pool -= cash_used
+            merged.at[idx, "Cash_restant"] = cash_pool
+            total_used += cash_used
+
+            shortfall = required - cash_used
+            if shortfall > 1e-9:
+                merged.at[idx, "Alerte"] = _format_alert(shortfall)
+
+        if total_used > initial_cash + 1e-6:
+            raise ValueError(
+                "Cash utilisation exceeded the available pool for portfolio "
+                f"{portfolio!r}."
+            )
+
+        if cash_pool < -1e-6:
+            raise ValueError(
+                "Cash remaining for portfolio "
+                f"{portfolio!r} became negative despite the safeguard."
+            )
+        if cash_pool < 0:
+            cash_pool = 0.0
+
+        if total_used:
+            key = portfolio if not pd.isna(portfolio) else None
+            total_cash_used_by_portfolio[key] = total_used
+
+        merged.loc[portfolio_df.index, "Cash_restant"] = cash_pool
+
+    total_cash_used = float(sum(total_cash_used_by_portfolio.values()))
+    if total_cash_used and cash_mask.any():
+        for portfolio_key, cash_used in total_cash_used_by_portfolio.items():
+            if not cash_used:
+                continue
+
+            if portfolio_key is None:
+                portfolio_mask = df[config.portfolio_col].isna()
+            else:
+                portfolio_mask = df[config.portfolio_col] == portfolio_key
+            mask = cash_mask & portfolio_mask
+            if not mask.any():
+                mask = cash_mask & df[config.portfolio_col].isna()
+            if not mask.any():
+                mask = cash_mask
+            if not mask.any():
+                continue
+
+            first_idx = df.index[mask][0]
+            current_tv = df.at[first_idx, "TV"]
+            current_tv = 0.0 if pd.isna(current_tv) else float(current_tv)
+            df.at[first_idx, "TV"] = current_tv - cash_used
 
     history_dt = (
         pd.Timestamp.today().normalize()
