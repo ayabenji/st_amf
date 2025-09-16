@@ -121,6 +121,15 @@ def _load_collateral_inputs(config: CollateralConfig) -> pd.DataFrame:
                 default = np.nan
             inputs[col] = default
 
+    for numeric_col in (
+        config.balance_prev_col,
+        config.threshold_col,
+        config.cash_col,
+        
+    ):
+        inputs[numeric_col] = pd.to_numeric(inputs[numeric_col], errors="coerce").fillna(0.0)
+
+
     return inputs
 
 
