@@ -69,6 +69,11 @@ def _load_collateral_inputs(config: CollateralConfig) -> pd.DataFrame:
     path = config.collateral_input_path
     if path.exists():
         inputs = pd.read_csv(path, sep=';',decimal=',',encoding='latin1')
+        inputs=inputs.rename(columns={
+        "Code portefeuille": "Portfolio",
+        "Contrepartie": "Counterparty"
+   
+    })
     else:
         inputs = pd.DataFrame(
             columns=[
@@ -83,7 +88,7 @@ def _load_collateral_inputs(config: CollateralConfig) -> pd.DataFrame:
     rename_map: dict[str, str] = {}
     alt_map = {
         config.counterparty_col: {"counterparty", "contrepartie"},
-        config.portfolio_col: {"portfolio", "portefeuille"},
+        config.portfolio_col: {"portfolio", "code portefeuille"},
         config.balance_prev_col: {"balance_j_1", "balance_j1", "balance_jmoins1"},
         config.threshold_col: {
             "seuil_de_declenchement",
@@ -121,11 +126,12 @@ def _load_collateral_inputs(config: CollateralConfig) -> pd.DataFrame:
                 default = np.nan
             inputs[col] = default
 
+    
+
     for numeric_col in (
         config.balance_prev_col,
         config.threshold_col,
         config.cash_col,
-        
     ):
         inputs[numeric_col] = pd.to_numeric(inputs[numeric_col], errors="coerce").fillna(0.0)
 
@@ -213,7 +219,7 @@ def process_pv_after_day_1(
         new_row.update({"Identifier": cash_identifier, "AssetClass": "Cash", "TV": total_futures_tv})
         df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
         cash_mask = df["Identifier"] == cash_identifier
-        print(df.loc[cash_mask,'TV'])
+       # print(df.loc[cash_mask,'TV'])
 
     if futures_mask.any():
         futures_mask = df["AssetClass"].isin(tuple(future_classes))
@@ -233,16 +239,18 @@ def process_pv_after_day_1(
         .rename(columns={"TV": "TV_before_collat"})
         .sort_values(group_cols)
     )
+    cp_port_tv = cp_port_tv[cp_port_tv['Counterparty'].notna()]
 
     cash_port_tv = (df.loc[df["Identifier"] == cash_identifier]
                     .groupby(config.portfolio_col,dropna= True)['TV']
                     .sum()
                     .reset_index(name=config.cash_col))
     
-    print(cash_port_tv)
+    #print(cash_port_tv)
 
 
     balances = cp_port_tv.rename(columns={"TV_before_collat": "Balance_J"})
+
     inputs = _load_collateral_inputs(config)
 
     merged = balances.merge(
@@ -257,6 +265,7 @@ def process_pv_after_day_1(
     )
 
     merged = merged.merge(cash_port_tv, on=config.portfolio_col, how="left")
+
 
     merged["Balance_J"] = merged["Balance_J"].fillna(0.0)
     merged[config.balance_prev_col] = merged[config.balance_prev_col].fillna(0.0)
@@ -278,6 +287,7 @@ def process_pv_after_day_1(
     merged["Balance_apres_appel"] = np.where(
         merged["Seuil_respecte"],
         merged[config.balance_prev_col],
+
         merged[config.balance_prev_col] + merged["Variation"],
     )
 
