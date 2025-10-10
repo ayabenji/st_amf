@@ -219,12 +219,13 @@ def process_pv_after_day_1(
         new_row.update({"Identifier": cash_identifier, "AssetClass": "Cash", "TV": total_futures_tv})
         df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
         cash_mask = df["Identifier"] == cash_identifier
-       # print(df.loc[cash_mask,'TV'])
 
-    if futures_mask.any():
-        futures_mask = df["AssetClass"].isin(tuple(future_classes))
+    
+    futures_mask = df["AssetClass"].isin(tuple(future_classes))
+    
 
-        df.loc[futures_mask, "TV"] = 0.0
+
+        #df.loc[futures_mask, "TV"] = 0.0
 
     group_cols = [config.counterparty_col, config.portfolio_col]
     missing_cols = [col for col in group_cols if col not in df.columns]
