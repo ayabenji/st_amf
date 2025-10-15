@@ -161,10 +161,13 @@ def _load_collateral_inputs(config: CollateralConfig) -> pd.DataFrame:
     return inputs
 
 
-def _format_alert(amount: float) -> str:
+def _format_alert(amount: float, *, reason: str | None = None) -> str:
     """Human readable representation of the missing cash amount."""
 
-    return f"cash insuffisant ({amount:,.2f})".replace(",", " ")
+    formatted_amount = f"{amount:,.2f}".replace(",", " ")
+    if reason:
+        return f"cash insuffisant ({reason} : {formatted_amount})"
+    return f"cash insuffisant ({formatted_amount})"
 
 
 def _consume_monetary_funds(
@@ -350,6 +353,12 @@ def process_pv_after_day_1(
             liquidity_score = bond_liquidity.at[idx]
             if not np.isfinite(liquidity_score):
                 continue
+            liquidity_score = float(liquidity_score)
+            if (
+                abs(liquidity_score - 9.0) > 1e-9
+                and abs(liquidity_score - 10.0) > 1e-9
+            ):
+                continue
             portfolio_value = df.at[idx, config.portfolio_col]
             key = portfolio_value if pd.notna(portfolio_value) else None
             tv_value = df.at[idx, "TV"]
@@ -438,6 +447,12 @@ def process_pv_after_day_1(
     merged["Cash_initial"] = merged[config.cash_col]
     merged["Cash_restant"] = merged[config.cash_col]
     merged["Cash_utilise"] = 0.0
+    merged["Cash_deficit_couvert_par_fonds"] = 0.0
+    merged["Cash_deficit_couvert_par_obligations"] = 0.0
+    merged["Futures_augmentent_cash"] = 0.0
+    merged["Futures_couverts_par_fonds"] = 0.0
+    merged["Futures_couverts_par_cash"] = 0.0
+    merged["Futures_couverts_par_obligations"] = 0.0
     merged["Fonds_monetaires_initial"] = 0.0
     merged["Fonds_monetaires_utilises"] = 0.0
     merged["Fonds_monetaires_restant"] = 0.0
@@ -471,6 +486,8 @@ def process_pv_after_day_1(
         merged.loc[portfolio_df.index, "Obligations_liquides_initial"] = bond_pool
 
         cash_deficit_fund_used = 0.0
+        cash_deficit_bond_used = 0.0
+        cash_deficit_alert: str | None = None
         if available_cash_pool < -1e-9 and fund_pool > 1e-9 and fund_indices:
             deficit_to_cover = -available_cash_pool
             converted = _consume_monetary_funds(df, fund_indices, deficit_to_cover)
@@ -482,11 +499,27 @@ def process_pv_after_day_1(
                     cash_adjustments_by_portfolio.get(key, 0.0) + converted
                 )
 
+        if available_cash_pool < -1e-9 and bond_pool > 1e-9 and bond_indices:
+            deficit_to_cover = -available_cash_pool
+            converted = _consume_ranked_assets(df, bond_indices, deficit_to_cover)
+            if converted > 0.0:
+                bond_pool = max(bond_pool - converted, 0.0)
+                available_cash_pool += converted
+                cash_deficit_bond_used = converted
+                cash_adjustments_by_portfolio[key] = (
+                    cash_adjustments_by_portfolio.get(key, 0.0) + converted
+                )
 
-        if available_cash_pool < 0:
+        if available_cash_pool < -1e-9:
+            cash_deficit_alert = _format_alert(
+                -available_cash_pool, reason="cash initial"
+            )
+            available_cash_pool = 0.0
+        elif available_cash_pool < 0:
             available_cash_pool = 0.0
 
         futures_effect = futures_by_portfolio.get(key, 0.0)
+        futures_cash_credit = 0.0
         futures_cash_used = 0.0
         futures_fund_used = 0.0
         futures_bond_used = 0.0
@@ -494,6 +527,7 @@ def process_pv_after_day_1(
 
         if futures_effect > 1e-9:
             available_cash_pool += futures_effect
+            futures_cash_credit = futures_effect
             cash_adjustments_by_portfolio[key] = (
                 cash_adjustments_by_portfolio.get(key, 0.0) + futures_effect
             )
@@ -517,11 +551,15 @@ def process_pv_after_day_1(
                     bond_pool = max(bond_pool - futures_bond_used, 0.0)
                     futures_need = max(futures_need - futures_bond_used, 0.0)
             if futures_need > 1e-9:
-                futures_shortfall_alert = _format_alert(futures_need)
+                    futures_shortfall_alert = _format_alert(
+                    futures_need, reason="futures"
+                )
 
         initial_cash = available_cash_pool + futures_cash_used
         total_used = futures_cash_used
+
         merged.loc[portfolio_df.index, "Cash_initial"] = initial_cash
+        merged.loc[portfolio_df.index, config.cash_col] = initial_cash
 
         needs_cash = groupama_mask.loc[portfolio_df.index].any()
         if not needs_cash:
@@ -535,6 +573,11 @@ def process_pv_after_day_1(
                         merged.at[first_idx, "Fonds_monetaires_utilises"]
                         + cash_deficit_fund_used
                     )
+                if cash_deficit_bond_used:
+                    merged.at[first_idx,"Obligations_liquides_utilisees"]=(
+                        merged.at[first_idx, "Obligations_liquides_utilisees"]
+                        + cash_deficit_bond_used
+                    )
                 if futures_fund_used:
                     merged.at[first_idx, "Fonds_monetaires_utilises"] = (
                         merged.at[first_idx, "Fonds_monetaires_utilises"] + futures_fund_used
@@ -547,13 +590,46 @@ def process_pv_after_day_1(
                     merged.at[first_idx, "Obligations_liquides_utilisees"] = (
                         merged.at[first_idx, "Obligations_liquides_utilisees"] + futures_bond_used
                     )
+                if cash_deficit_fund_used:
+                    merged.at[first_idx, "Cash_deficit_couvert_par_fonds"] = (
+                        merged.at[first_idx, "Cash_deficit_couvert_par_fonds"]
+                        + cash_deficit_fund_used
+                    )
+                if cash_deficit_bond_used:
+                    merged.at[first_idx, "Cash_deficit_couvert_par_obligations"] = (
+                        merged.at[first_idx, "Cash_deficit_couvert_par_obligations"]
+                        + cash_deficit_bond_used
+                    )
+                if futures_cash_credit:
+                    merged.at[first_idx, "Futures_augmentent_cash"] = (
+                        merged.at[first_idx, "Futures_augmentent_cash"] + futures_cash_credit
+                    )
+                if futures_fund_used:
+                    merged.at[first_idx, "Futures_couverts_par_fonds"] = (
+                        merged.at[first_idx, "Futures_couverts_par_fonds"] + futures_fund_used
+                    )
+                if futures_cash_used:
+                    merged.at[first_idx, "Futures_couverts_par_cash"] = (
+                        merged.at[first_idx, "Futures_couverts_par_cash"] + futures_cash_used
+                    )
+                if futures_bond_used:
+                    merged.at[first_idx, "Futures_couverts_par_obligations"] = (
+                        merged.at[first_idx, "Futures_couverts_par_obligations"] + futures_bond_used
+                    )
                 if futures_shortfall_alert:
                     existing_alert = merged.at[first_idx, "Alerte"]
                     if pd.isna(existing_alert):
                         merged.at[first_idx, "Alerte"] = futures_shortfall_alert
                     else:
                         merged.at[first_idx, "Alerte"] = f"{existing_alert} ; {futures_shortfall_alert}"
+                if cash_deficit_alert:
+                    existing_alert = merged.at[first_idx, "Alerte"]
+                    if pd.isna(existing_alert):
+                        merged.at[first_idx, "Alerte"] = cash_deficit_alert
+                    else:
+                        merged.at[first_idx, "Alerte"] = f"{existing_alert} ; {cash_deficit_alert}"
             monetary_remaining_by_portfolio[key] = fund_pool
+            bond_remaining_by_portfolio[key]= bond_pool
             continue
 
         for idx in portfolio_df.index:
@@ -617,7 +693,9 @@ def process_pv_after_day_1(
 
             shortfall = required
             if shortfall > 1e-9:
-                merged.at[idx, "Alerte"] = _format_alert(shortfall)
+                merged.at[idx, "Alerte"] = _format_alert(
+                    shortfall, reason="appel collateral"
+                )
 
         if portfolio_df.index.size:
             first_idx = portfolio_df.index[0]        
@@ -625,17 +703,41 @@ def process_pv_after_day_1(
                 merged.at[first_idx, "Fonds_monetaires_utilises"] = (
                     merged.at[first_idx, "Fonds_monetaires_utilises"] + cash_deficit_fund_used
                 )
+                merged.at[first_idx, "Cash_deficit_couvert_par_fonds"] = (
+                    merged.at[first_idx, "Cash_deficit_couvert_par_fonds"] + cash_deficit_fund_used
+                )
+            if cash_deficit_bond_used: 
+                merged.at[first_idx, "Obligations_liquides_utilisees"] = (
+                    merged.at[first_idx, "Obligations_liquides_utilisees"] + cash_deficit_bond_used
+                )
+                merged.at[first_idx, "Cash_deficit_couvert_par_obligations"] = (
+                    merged.at[first_idx, "Cash_deficit_couvert_par_obligations"]
+                    + cash_deficit_bond_used
+                )
             if futures_fund_used:
                 merged.at[first_idx, "Fonds_monetaires_utilises"] = (
                     merged.at[first_idx, "Fonds_monetaires_utilises"] + futures_fund_used
-                )               
+                )   
+                merged.at[first_idx, "Futures_couverts_par_fonds"] = (
+                    merged.at[first_idx, "Futures_couverts_par_fonds"] + futures_fund_used
+                )            
             if futures_cash_used:
                 merged.at[first_idx, "Cash_utilise"] = (
                     merged.at[first_idx, "Cash_utilise"] + futures_cash_used
                 )
+                merged.at[first_idx, "Futures_couverts_par_cash"] = (
+                    merged.at[first_idx, "Futures_couverts_par_cash"] + futures_cash_used
+                )
             if futures_bond_used:
                 merged.at[first_idx, "Obligations_liquides_utilisees"] = (
                     merged.at[first_idx, "Obligations_liquides_utilisees"] + futures_bond_used
+                )
+                merged.at[first_idx, "Futures_couverts_par_obligations"] = (
+                    merged.at[first_idx, "Futures_couverts_par_obligations"] + futures_bond_used
+                )
+            if futures_cash_credit:
+                merged.at[first_idx, "Futures_augmentent_cash"] = (
+                    merged.at[first_idx, "Futures_augmentent_cash"] + futures_cash_credit
                 )
             if futures_shortfall_alert:
                 existing_alert = merged.at[first_idx, "Alerte"]
@@ -643,6 +745,13 @@ def process_pv_after_day_1(
                     merged.at[first_idx, "Alerte"] = futures_shortfall_alert
                 else:
                     merged.at[first_idx, "Alerte"] = f"{existing_alert} ; {futures_shortfall_alert}"
+
+            if cash_deficit_alert:
+                existing_alert = merged.at[first_idx, "Alerte"]
+                if pd.isna(existing_alert):
+                    merged.at[first_idx, "Alerte"] = cash_deficit_alert
+                else:
+                    merged.at[first_idx, "Alerte"] = f"{existing_alert} ; {cash_deficit_alert}"
 
         if total_used > initial_cash + 1e-6:
             raise ValueError(
@@ -771,6 +880,12 @@ def process_pv_after_day_1(
         "Obligations_liquides_initial",
         "Obligations_liquides_utilisees",
         "Obligations_liquides_restantes",
+        "Cash_deficit_couvert_par_fonds",
+        "Cash_deficit_couvert_par_obligations",
+        "Futures_augmentent_cash",
+        "Futures_couverts_par_fonds",
+        "Futures_couverts_par_cash",
+        "Futures_couverts_par_obligations",
         "Cash_initial",
         "Cash_disponible",
         "Cash_utilise",
