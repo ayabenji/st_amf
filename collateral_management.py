@@ -30,6 +30,7 @@ class CollateralConfig:
     collateral_input_path: Path = Path(r"C:\Users\abenjelloun\OneDrive - Cooperactions\GAM-E-Risk Perf - RMP\1.PROD\1.REGLEMENTAIRE\14.Stress Test AMF (JB)\Production\Périmètre et positions\Collat_Cash_MTM_20250401.csv")
 
     collateral_history_path: Path = Path("collateral_history.xlsx")
+    monetary_fund_usage_history_path: Path = Path("monetary_fund_usage_history.xlsx")
     counterparty_col: str = "Counterparty"
     portfolio_col: str = "Portfolio"
     balance_prev_col: str = "Balance_J_1"
@@ -38,11 +39,13 @@ class CollateralConfig:
 
     def ensure_directories(self) -> None:
         """Create parent folders for the configured files if necessary."""
-
-        for path in (self.collateral_input_path, self.collateral_history_path):
-            if path.parent and path.parent != Path(""):
-                path.parent.mkdir(parents=True, exist_ok=True)
-
+        for path in (
+            self.collateral_input_path,
+            self.collateral_history_path,
+            self.monetary_fund_usage_history_path,
+        ):
+                if path.parent and path.parent != Path(""):
+                    path.parent.mkdir(parents=True, exist_ok=True)
 
 def _normalise_asset_identifier(value: object) -> str | None:
     """Return a comparable representation of an asset identifier."""
@@ -56,13 +59,38 @@ def _normalise_asset_identifier(value: object) -> str | None:
 MONETARY_FUND_ASSET_IDS = {
     "GROUPAMA MONETAIRE- IC",
     "GROUPAMA TRESORERIE I",
-    "GROUPAMA ENTREPRISES I"
+    "GROUPAMA ENTREPRISES I",
+    "GROUPAMA ULTRA SHORT TERM - IC"
 }
 
 _NORMALISED_MONETARY_FUND_IDS = {
     _normalise_asset_identifier(name) for name in MONETARY_FUND_ASSET_IDS
 }
 
+_MONETARY_FUND_PORTFOLIO_CODES = {
+    _normalise_asset_identifier("GROUPAMA MONETAIRE- IC"): "300636",
+    _normalise_asset_identifier("GROUPAMA ENTREPRISES I"): "300208",
+    _normalise_asset_identifier("GROUPAMA TRESORERIE I"): "300203",
+    _normalise_asset_identifier("GROUPAMA ULTRA SHORT TERM - IC"): "389038",
+}
+
+
+def _normalise_portfolio_value(value: object) -> str | None:
+    """Return a normalised textual representation of a portfolio identifier."""
+
+    if value is None:
+        return None
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    if isinstance(value, float):
+        if not np.isfinite(value):
+            return None
+        rounded = round(value)
+        if abs(value - rounded) < 1e-9:
+            return str(int(rounded))
+        return f"{value}".strip()
+    text = str(value).strip()
+    return text or None
 
 def _normalise_column_name(name: str) -> str:
     """Return a simplified representation used to identify columns."""
@@ -231,6 +259,10 @@ def process_pv_after_day_1(
         "Equity Index Future",
         "FX Future",
     ),
+    option_classes: Iterable[str] | Tuple[str, ...] = (
+        "Bond Future Option",
+        "FX Option",
+    ),
     cash_identifier: str = "CSH_EUR_DB",
     config: CollateralConfig | None = None,
     history_date: str | pd.Timestamp | None = None,
@@ -281,7 +313,18 @@ def process_pv_after_day_1(
     if "AssetClass" not in df.columns:
         raise KeyError("Column 'AssetClass' missing in exposures_next")
 
-    futures_mask = df["AssetClass"].isin(tuple(future_classes))
+    asset_class_values = df["AssetClass"].astype(str).str.strip()
+    asset_class_lower = asset_class_values.str.lower()
+    futures_mask = asset_class_values.isin(tuple(future_classes))
+    if option_classes is None:
+        options_mask = asset_class_lower.str.contains("option", na=False)
+    else:
+        options_mask = asset_class_values.isin(tuple(option_classes))
+    options_mask = options_mask & ~futures_mask
+    derivative_mask = futures_mask | options_mask
+
+    if "TV" not in df.columns:
+        raise KeyError("Column 'TV' missing in exposures_next")
     futures_tv = (
         df.loc[futures_mask]
         .groupby("AssetClass", as_index=False)["TV"].sum()
@@ -289,21 +332,88 @@ def process_pv_after_day_1(
         .sort_values("AssetClass")
     )
 
+
+    original_tv_series = pd.to_numeric(df["TV"], errors="coerce").fillna(0.0)
+    portfolio_nav_map: dict[object, float] = {}
+    portfolio_nav_normalised: dict[str, float] = {}
+    if config.portfolio_col in df.columns:
+        grouped_nav = original_tv_series.groupby(df[config.portfolio_col], dropna=False).sum()
+        for portfolio_value, nav in grouped_nav.items():
+            key = portfolio_value if pd.notna(portfolio_value) else None
+            nav_value = float(nav)
+            portfolio_nav_map[key] = nav_value
+            normalised_key = _normalise_portfolio_value(key)
+            if normalised_key is not None:
+                portfolio_nav_normalised[normalised_key] = nav_value
+            
+
+
+    if "TV_prev" not in df.columns:
+        raise KeyError("Column 'TV_prev' is required to derive futures stress effects.")
+
+    tv_prev_series = pd.to_numeric(df["TV_prev"], errors="coerce").fillna(0.0)
+
+    normalised_cols = {
+        _normalise_column_name(col): col for col in df.columns
+    }
+    net_exposure_col = None
+    for candidate in ("NetExposure", "Net Exposure", "Net_Exposure"):
+        simplified = _normalise_column_name(candidate)
+        if simplified in normalised_cols:
+            net_exposure_col = normalised_cols[simplified]
+            break
+    if net_exposure_col is None:
+        raise KeyError(
+            "Column 'NetExposure' (or equivalent) is required to process futures."
+        )
+
+    net_exposure_series = pd.to_numeric(
+        df[net_exposure_col], errors="coerce"
+    ).fillna(0.0)
+
+    derivative_effect_series = original_tv_series - tv_prev_series
+    futures_effect_series = derivative_effect_series.where(futures_mask, 0.0)
+    options_effect_series = derivative_effect_series.where(options_mask, 0.0)
+
+
+    if futures_mask.any():
+        df.loc[futures_mask, "TV"] = net_exposure_series.loc[futures_mask]
+    if options_mask.any():
+        df.loc[options_mask, "TV"] = tv_prev_series.loc[options_mask]
+
+
     futures_by_portfolio: dict[object, float] = {}
     if config.portfolio_col in df.columns and futures_mask.any():
+        futures_effect = futures_effect_series.where(futures_mask,0.0)
         grouped_futures = (
-            df.loc[futures_mask]
-            .groupby(config.portfolio_col, dropna=False)["TV"].sum()
+           futures_effect_series
+            .groupby(df[config.portfolio_col], dropna=False).sum()
         )
         for portfolio_key, value in grouped_futures.items():
             key = portfolio_key if pd.notna(portfolio_key) else None
             futures_by_portfolio[key] = float(value)
 
+    options_by_portfolio: dict[object, float] = {}
+    if config.portfolio_col in df.columns and options_mask.any():
+        options_effect = options_effect_series.where(options_mask, 0.0)
+        grouped_options = options_effect.groupby(
+            df[config.portfolio_col], dropna=False
+        ).sum()
+        for portfolio_key, value in grouped_options.items():
+            key = portfolio_key if pd.notna(portfolio_key) else None
+            options_by_portfolio[key] = float(value)
 
-    futures_mask = df["AssetClass"].isin(tuple(future_classes))
+    # Recompute masks in case the dataframe structure changed after previous operations.
+    asset_class_values = df["AssetClass"].astype(str).str.strip()
+    asset_class_lower = asset_class_values.str.lower()
+    futures_mask = asset_class_values.isin(tuple(future_classes))
+    if option_classes is None:
+        options_mask = asset_class_lower.str.contains("option", na=False)
+    else:
+        options_mask = asset_class_values.isin(tuple(option_classes))
+    options_mask = options_mask & ~futures_mask
     
-
-
+    
 
 
     asset_id_col = next(
@@ -316,7 +426,7 @@ def process_pv_after_day_1(
             "from exposures_next"
         )
 
-    asset_class_series = df["AssetClass"].astype(str).str.strip().str.lower()
+    asset_class_series = asset_class_lower
     asset_id_normalised = df[asset_id_col].map(_normalise_asset_identifier)
     monetary_fund_mask = asset_class_series.eq("fund unit") & asset_id_normalised.isin(
         _NORMALISED_MONETARY_FUND_IDS
@@ -324,6 +434,8 @@ def process_pv_after_day_1(
 
     monetary_indices_by_portfolio: dict[object, list[object]] = {}
     monetary_remaining_by_portfolio: dict[object, float] = {}
+    monetary_index_to_key: dict[object, tuple[object, str]] = {}
+    fund_usage_by_key: dict[tuple[object, str], float] = {}
     for idx in df.index[monetary_fund_mask]:
         portfolio_value = df.at[idx, config.portfolio_col]
         key = portfolio_value if pd.notna(portfolio_value) else None
@@ -334,6 +446,43 @@ def process_pv_after_day_1(
         monetary_remaining_by_portfolio[key] = (
             monetary_remaining_by_portfolio.get(key, 0.0) + float(tv_value)
         )
+    
+        asset_label = df.at[idx, asset_id_col]
+        asset_label_str = "" if pd.isna(asset_label) else str(asset_label)
+        monetary_index_to_key[idx] = (key, asset_label_str)
+
+    def _snapshot_fund_tv(indices: list[object]) -> pd.Series:
+        if not indices:
+            return pd.Series(dtype=float)
+        snapshot = pd.to_numeric(df.loc[indices, "TV"], errors="coerce").fillna(0.0)
+        snapshot.index = indices
+        return snapshot
+
+    def _record_monetary_usage(before: pd.Series, reason: str) -> None:
+        if before.empty:
+            return
+        after = pd.to_numeric(df.loc[before.index, "TV"], errors="coerce").fillna(0.0)
+        for idx, before_val in before.items():
+            after_val = after.at[idx]
+            used = float(before_val) - float(after_val)
+            if used <= 1e-9:
+                continue
+            portfolio_key, asset_label = monetary_index_to_key.get(idx, (None, ""))
+            key = (portfolio_key, asset_label)
+            entry = fund_usage_by_key.setdefault(
+                key,
+                {
+                    "total": 0.0,
+                    "cash_deficit": 0.0,
+                    "futures": 0.0,
+                    "options": 0.0,
+                    "collateral": 0.0,
+                },
+            )
+            entry["total"] += used
+            if reason not in entry:
+                raise ValueError(f"Unsupported monetary fund usage reason: {reason!r}")
+            entry[reason] += used
 
     bond_mask = asset_class_series.eq("bond")
     bond_liquidity: pd.Series
@@ -381,7 +530,7 @@ def process_pv_after_day_1(
         raise KeyError(f"Missing columns in exposures_next: {', '.join(missing_cols)}")
 
     cp_port_tv = (
-        df.loc[~futures_mask & (df["Identifier"] != cash_identifier)]
+        df.loc[~derivative_mask & (df["Identifier"] != cash_identifier)]
         .groupby(group_cols, dropna=False)["TV"]
         .sum()
         .reset_index()
@@ -453,6 +602,10 @@ def process_pv_after_day_1(
     merged["Futures_couverts_par_fonds"] = 0.0
     merged["Futures_couverts_par_cash"] = 0.0
     merged["Futures_couverts_par_obligations"] = 0.0
+    merged["Options_augmentent_cash"] = 0.0
+    merged["Options_couverts_par_fonds"] = 0.0
+    merged["Options_couverts_par_cash"] = 0.0
+    merged["Options_couverts_par_obligations"] = 0.0
     merged["Fonds_monetaires_initial"] = 0.0
     merged["Fonds_monetaires_utilises"] = 0.0
     merged["Fonds_monetaires_restant"] = 0.0
@@ -490,6 +643,7 @@ def process_pv_after_day_1(
         cash_deficit_alert: str | None = None
         if available_cash_pool < -1e-9 and fund_pool > 1e-9 and fund_indices:
             deficit_to_cover = -available_cash_pool
+            snapshot_before = _snapshot_fund_tv(fund_indices)
             converted = _consume_monetary_funds(df, fund_indices, deficit_to_cover)
             if converted > 0.0:
                 fund_pool = max(fund_pool - converted, 0.0)
@@ -498,6 +652,7 @@ def process_pv_after_day_1(
                 cash_adjustments_by_portfolio[key] = (
                     cash_adjustments_by_portfolio.get(key, 0.0) + converted
                 )
+                _record_monetary_usage(snapshot_before, "cash_deficit")
 
         if available_cash_pool < -1e-9 and bond_pool > 1e-9 and bond_indices:
             deficit_to_cover = -available_cash_pool
@@ -525,12 +680,26 @@ def process_pv_after_day_1(
         futures_bond_used = 0.0
         futures_shortfall_alert: str | None = None
 
+        options_effect = options_by_portfolio.get(key, 0.0)
+        options_cash_credit = 0.0
+        options_cash_used = 0.0
+        options_fund_used = 0.0
+        options_bond_used = 0.0
+        options_shortfall_alert: str | None = None
+
         if futures_effect > 1e-9:
             available_cash_pool += futures_effect
             futures_cash_credit = futures_effect
             cash_adjustments_by_portfolio[key] = (
                 cash_adjustments_by_portfolio.get(key, 0.0) + futures_effect
             )
+        if options_effect > 1e-9:
+            available_cash_pool += options_effect
+            options_cash_credit = options_effect
+            cash_adjustments_by_portfolio[key] = (
+                cash_adjustments_by_portfolio.get(key, 0.0) + options_effect
+            )
+
         elif futures_effect < -1e-9:
             futures_need = -futures_effect
             if fund_pool > 1e-9 and fund_indices:
@@ -538,6 +707,7 @@ def process_pv_after_day_1(
                 if futures_fund_used > 0.0:
                     fund_pool = max(fund_pool - futures_fund_used, 0.0)
                     futures_need = max(futures_need - futures_fund_used, 0.0)
+                    _record_monetary_usage(snapshot_before, "futures")
             if futures_need > 1e-9 and available_cash_pool > 0.0:
                 futures_cash_used = min(futures_need, available_cash_pool)
                 available_cash_pool = max(available_cash_pool - futures_cash_used, 0.0)
@@ -555,8 +725,34 @@ def process_pv_after_day_1(
                     futures_need, reason="futures"
                 )
 
-        initial_cash = available_cash_pool + futures_cash_used
-        total_used = futures_cash_used
+        if options_effect < -1e-9:
+            options_need = -options_effect
+            if fund_pool > 1e-9 and fund_indices:
+                snapshot_before = _snapshot_fund_tv(fund_indices)
+                options_fund_used = _consume_monetary_funds(df, fund_indices, options_need)
+                if options_fund_used > 0.0:
+                    fund_pool = max(fund_pool - options_fund_used, 0.0)
+                    options_need = max(options_need - options_fund_used, 0.0)
+                    _record_monetary_usage(snapshot_before, "options")
+            if options_need > 1e-9 and available_cash_pool > 0.0:
+                options_cash_used = min(options_need, available_cash_pool)
+                available_cash_pool = max(available_cash_pool - options_cash_used, 0.0)
+                options_need = max(options_need - options_cash_used, 0.0)
+                cash_adjustments_by_portfolio[key] = (
+                    cash_adjustments_by_portfolio.get(key, 0.0) - options_cash_used
+                )
+            if options_need > 1e-9 and bond_pool > 1e-9 and bond_indices:
+                options_bond_used = _consume_ranked_assets(df, bond_indices, options_need)
+                if options_bond_used > 0.0:
+                    bond_pool = max(bond_pool - options_bond_used, 0.0)
+                    options_need = max(options_need - options_bond_used, 0.0)
+            if options_need > 1e-9:
+                options_shortfall_alert = _format_alert(
+                    options_need, reason="options"
+                )
+
+        initial_cash = available_cash_pool + futures_cash_used + options_cash_used
+        total_used = futures_cash_used + options_cash_used
 
         merged.loc[portfolio_df.index, "Cash_initial"] = initial_cash
         merged.loc[portfolio_df.index, config.cash_col] = initial_cash
@@ -589,6 +785,18 @@ def process_pv_after_day_1(
                 if futures_bond_used:
                     merged.at[first_idx, "Obligations_liquides_utilisees"] = (
                         merged.at[first_idx, "Obligations_liquides_utilisees"] + futures_bond_used
+                    )
+                if options_fund_used:
+                    merged.at[first_idx, "Fonds_monetaires_utilises"] = (
+                        merged.at[first_idx, "Fonds_monetaires_utilises"] + options_fund_used
+                    )
+                if options_cash_used:
+                    merged.at[first_idx, "Cash_utilise"] = (
+                        merged.at[first_idx, "Cash_utilise"] + options_cash_used
+                    )
+                if options_bond_used:
+                    merged.at[first_idx, "Obligations_liquides_utilisees"] = (
+                        merged.at[first_idx, "Obligations_liquides_utilisees"] + options_bond_used
                     )
                 if cash_deficit_fund_used:
                     merged.at[first_idx, "Cash_deficit_couvert_par_fonds"] = (
@@ -628,6 +836,31 @@ def process_pv_after_day_1(
                         merged.at[first_idx, "Alerte"] = cash_deficit_alert
                     else:
                         merged.at[first_idx, "Alerte"] = f"{existing_alert} ; {cash_deficit_alert}"
+                if options_cash_credit:
+                    merged.at[first_idx, "Options_augmentent_cash"] = (
+                        merged.at[first_idx, "Options_augmentent_cash"] + options_cash_credit
+                    )
+                if options_fund_used:
+                    merged.at[first_idx, "Options_couverts_par_fonds"] = (
+                        merged.at[first_idx, "Options_couverts_par_fonds"] + options_fund_used
+                    )
+                if options_cash_used:
+                    merged.at[first_idx, "Options_couverts_par_cash"] = (
+                        merged.at[first_idx, "Options_couverts_par_cash"] + options_cash_used
+                    )
+                if options_bond_used:
+                    merged.at[first_idx, "Options_couverts_par_obligations"] = (
+                        merged.at[first_idx, "Options_couverts_par_obligations"]
+                        + options_bond_used
+                    )
+                if options_shortfall_alert:
+                    existing_alert = merged.at[first_idx, "Alerte"]
+                    if pd.isna(existing_alert):
+                        merged.at[first_idx, "Alerte"] = options_shortfall_alert
+                    else:
+                        merged.at[first_idx, "Alerte"] = (
+                            f"{existing_alert} ; {options_shortfall_alert}"
+                        )
             monetary_remaining_by_portfolio[key] = fund_pool
             bond_remaining_by_portfolio[key]= bond_pool
             continue
@@ -649,13 +882,16 @@ def process_pv_after_day_1(
                 fund_indices = monetary_indices_by_portfolio.get(key, [])
                 remaining_need = min(required, fund_pool)
                 while remaining_need > 1e-9 and fund_pool > 1e-9:
+                    snapshot_before = _snapshot_fund_tv(fund_indices)
                     consumed = _consume_monetary_funds(df, fund_indices, remaining_need)
+                    
                     if consumed <= 1e-9:
                         break
                     fund_used += consumed
                     fund_pool = max(fund_pool - consumed, 0.0)
                     required = max(required - consumed, 0.0)
                     remaining_need = min(required, fund_pool)
+                    _record_monetary_usage(snapshot_before,"collateral")
 
                 if required > 1e-6 and fund_pool > 1e-6:
                     raise ValueError(
@@ -752,6 +988,39 @@ def process_pv_after_day_1(
                     merged.at[first_idx, "Alerte"] = cash_deficit_alert
                 else:
                     merged.at[first_idx, "Alerte"] = f"{existing_alert} ; {cash_deficit_alert}"
+            if options_fund_used:
+                merged.at[first_idx, "Fonds_monetaires_utilises"] = (
+                    merged.at[first_idx, "Fonds_monetaires_utilises"] + options_fund_used
+                )
+                merged.at[first_idx, "Options_couverts_par_fonds"] = (
+                    merged.at[first_idx, "Options_couverts_par_fonds"] + options_fund_used
+                )
+            if options_cash_used:
+                merged.at[first_idx, "Cash_utilise"] = (
+                    merged.at[first_idx, "Cash_utilise"] + options_cash_used
+                )
+                merged.at[first_idx, "Options_couverts_par_cash"] = (
+                    merged.at[first_idx, "Options_couverts_par_cash"] + options_cash_used
+                )
+            if options_bond_used:
+                merged.at[first_idx, "Obligations_liquides_utilisees"] = (
+                    merged.at[first_idx, "Obligations_liquides_utilisees"] + options_bond_used
+                )
+                merged.at[first_idx, "Options_couverts_par_obligations"] = (
+                    merged.at[first_idx, "Options_couverts_par_obligations"] + options_bond_used
+                )
+            if options_cash_credit:
+                merged.at[first_idx, "Options_augmentent_cash"] = (
+                    merged.at[first_idx, "Options_augmentent_cash"] + options_cash_credit
+                )
+            if options_shortfall_alert:
+                existing_alert = merged.at[first_idx, "Alerte"]
+                if pd.isna(existing_alert):
+                    merged.at[first_idx, "Alerte"] = options_shortfall_alert
+                else:
+                    merged.at[first_idx, "Alerte"] = (
+                        f"{existing_alert} ; {options_shortfall_alert}"
+                    )
 
         if total_used > initial_cash + 1e-6:
             raise ValueError(
@@ -850,6 +1119,309 @@ def process_pv_after_day_1(
         "Alerte",
     ]]
 
+    def _lookup_portfolio_nav(key: object) -> float | None:
+        normalised = _normalise_portfolio_value(key)
+        if normalised is not None:
+            nav_value = portfolio_nav_normalised.get(normalised)
+            if nav_value is not None:
+                return nav_value
+        return portfolio_nav_map.get(key)
+
+    usage_records: list[dict[str, object]] = []
+    for (portfolio_key, asset_label), usage in fund_usage_by_key.items():
+        total_used = float(usage.get("total", 0.0))
+        cash_deficit_used = float(usage.get("cash_deficit", 0.0))
+        futures_used = float(usage.get("futures", 0.0))
+        options_used = float(usage.get("options", 0.0))
+        collateral_used = float(usage.get("collateral", 0.0))
+
+        amount_signed = -total_used
+        cash_deficit_signed = -cash_deficit_used
+        futures_signed = -futures_used
+        options_signed = -options_used
+        collateral_signed = -collateral_used
+        nav_value = None
+        normalised_asset = _normalise_asset_identifier(asset_label)
+        if normalised_asset is not None:
+            mapped_portfolio = _MONETARY_FUND_PORTFOLIO_CODES.get(normalised_asset)
+            if mapped_portfolio is not None:
+                nav_value = _lookup_portfolio_nav(mapped_portfolio)
+        if nav_value is None:
+            nav_value = _lookup_portfolio_nav(portfolio_key)
+
+        nav_valid = nav_value is not None and abs(nav_value) > 1e-9
+        nav_output = float(nav_value) if nav_valid else np.nan
+        pct_total = amount_signed / nav_output if nav_valid else np.nan
+        pct_cash_deficit = (
+            cash_deficit_signed / nav_output if nav_valid else np.nan
+        )
+        pct_futures = futures_signed / nav_output if nav_valid else np.nan
+        pct_options = options_signed / nav_output if nav_valid else np.nan
+        pct_collateral = (
+            collateral_signed / nav_output if nav_valid else np.nan
+        )
+        usage_records.append(
+            {
+                "Date": history_dt,
+                "Portefeuille": portfolio_key if portfolio_key is not None else np.nan,
+                "Fonds_monetaires": asset_label,
+                "Montant_vendu": amount_signed,
+                "Montant_vendu_deficit_cash": cash_deficit_signed,
+                "Montant_vendu_futures": futures_signed,
+                "Montant_vendu_options": options_signed,
+                "Montant_vendu_appel_collat": collateral_signed,
+                "Actif_net_portefeuille": nav_output,
+                "Vente_pct_actif_net": pct_total,
+                "Vente_pct_deficit_cash": pct_cash_deficit,
+                "Vente_pct_futures": pct_futures,
+                "Vente_pct_options": pct_options,
+                "Vente_pct_appel_collat": pct_collateral,
+            }
+        )
+
+    usage_path = config.monetary_fund_usage_history_path
+    usage_columns = [
+        "Date",
+        "Portefeuille",
+        "Fonds_monetaires",
+        "Montant_vendu",
+        "Montant_vendu_deficit_cash",
+        "Montant_vendu_futures",
+        "Montant_vendu_options",
+        "Montant_vendu_appel_collat",
+        "Actif_net_portefeuille",
+        "Vente_pct_actif_net",
+        "Vente_pct_deficit_cash",
+        "Vente_pct_futures",
+        "Vente_pct_options",
+        "Vente_pct_appel_collat",
+        "Montant_vendu_cumule",
+        "Montant_vendu_deficit_cash_cumule",
+        "Montant_vendu_futures_cumule",
+        "Montant_vendu_options_cumule",
+        "Montant_vendu_appel_collat_cumule",
+        "Vente_pct_cumule_actif_net",
+        "Vente_pct_cumule_deficit_cash",
+        "Vente_pct_cumule_futures",
+        "Vente_pct_cumule_options",
+        "Vente_pct_cumule_appel_collat",
+    ]
+
+    if usage_path.exists():
+        existing_usage = pd.read_excel(usage_path)
+    else:
+        existing_usage = pd.DataFrame(columns=usage_columns)
+
+    usage_df = pd.DataFrame(usage_records, columns=usage_columns)
+    if not existing_usage.empty:
+        existing_usage = existing_usage.reindex(columns=usage_columns)
+        usage_df = pd.concat([existing_usage, usage_df], ignore_index=True, sort=False)
+
+    if not existing_usage.empty:
+        existing_usage = existing_usage.reindex(columns=usage_columns)
+        usage_df = pd.concat([existing_usage, usage_df], ignore_index=True, sort=False)
+
+    if not usage_df.empty:
+        usage_df = usage_df.sort_values(
+            ["Portefeuille", "Fonds_monetaires", "Date"], ignore_index=True
+        )
+
+        numeric_cols = [
+            "Montant_vendu",
+            "Montant_vendu_deficit_cash",
+            "Montant_vendu_futures",
+            "Montant_vendu_options",
+            "Montant_vendu_appel_collat",
+            "Actif_net_portefeuille",
+            "Vente_pct_actif_net",
+            "Vente_pct_deficit_cash",
+            "Vente_pct_futures",
+            "Vente_pct_options",
+            "Vente_pct_appel_collat",
+        ]
+        for col in numeric_cols:
+            usage_df[col] = pd.to_numeric(usage_df.get(col), errors="coerce")
+
+        group_keys = ["Portefeuille", "Fonds_monetaires"]
+        grouped = usage_df.groupby(group_keys, dropna=False)
+        usage_df["Montant_vendu_cumule"] = grouped["Montant_vendu"].cumsum()
+        usage_df["Montant_vendu_deficit_cash_cumule"] = grouped[
+            "Montant_vendu_deficit_cash"
+        ].cumsum()
+        usage_df["Montant_vendu_futures_cumule"] = grouped[
+            "Montant_vendu_futures"
+        ].cumsum()
+        usage_df["Montant_vendu_options_cumule"] = grouped[
+            "Montant_vendu_options"
+        ].cumsum()
+        usage_df["Montant_vendu_appel_collat_cumule"] = grouped[
+            "Montant_vendu_appel_collat"
+        ].cumsum()
+
+        nav_abs = usage_df["Actif_net_portefeuille"].abs()
+        safe_nav = nav_abs > 1e-9
+        usage_df["Vente_pct_actif_net"] = np.where(
+            safe_nav,
+            usage_df["Montant_vendu"] / usage_df["Actif_net_portefeuille"],
+            np.nan,
+        )
+        usage_df["Vente_pct_deficit_cash"] = np.where(
+            safe_nav,
+            usage_df["Montant_vendu_deficit_cash"]
+            / usage_df["Actif_net_portefeuille"],
+            np.nan,
+        )
+        usage_df["Vente_pct_futures"] = np.where(
+            safe_nav,
+            usage_df["Montant_vendu_futures"]
+            / usage_df["Actif_net_portefeuille"],
+            np.nan,
+        )
+        usage_df["Vente_pct_options"] = np.where(
+            safe_nav,
+            usage_df["Montant_vendu_options"]
+            / usage_df["Actif_net_portefeuille"],
+            np.nan,
+        )
+        usage_df["Vente_pct_appel_collat"] = np.where(
+            safe_nav,
+            usage_df["Montant_vendu_appel_collat"]
+            / usage_df["Actif_net_portefeuille"],
+            np.nan,
+        )
+        usage_df["Vente_pct_cumule_actif_net"] = np.where(
+            safe_nav,
+            usage_df["Montant_vendu_cumule"]
+            / usage_df["Actif_net_portefeuille"],
+            np.nan,
+        )
+        usage_df["Vente_pct_cumule_deficit_cash"] = np.where(
+            safe_nav,
+            usage_df["Montant_vendu_deficit_cash_cumule"]
+            / usage_df["Actif_net_portefeuille"],
+            np.nan,
+        )
+        usage_df["Vente_pct_cumule_futures"] = np.where(
+            safe_nav,
+            usage_df["Montant_vendu_futures_cumule"]
+            / usage_df["Actif_net_portefeuille"],
+            np.nan,
+        )
+        usage_df["Vente_pct_cumule_options"] = np.where(
+            safe_nav,
+            usage_df["Montant_vendu_options_cumule"]
+            / usage_df["Actif_net_portefeuille"],
+            np.nan,
+        )
+        usage_df["Vente_pct_cumule_appel_collat"] = np.where(
+            safe_nav,
+            usage_df["Montant_vendu_appel_collat_cumule"]
+            / usage_df["Actif_net_portefeuille"],
+            np.nan,
+        )
+
+
+
+
+    usage_df = usage_df[usage_columns]
+
+    usage_df.to_excel(usage_path, index=False)
+
+    normalised_cols = {_normalise_column_name(col): col for col in df.columns}
+
+    tv_series = pd.to_numeric(df.get("TV"), errors="coerce").fillna(0.0)
+    tv_prev_current = pd.to_numeric(df.get("TV_prev"), errors="coerce").fillna(0.0)
+    ratio = np.divide(
+        tv_series,
+        tv_prev_current,
+        out=np.zeros(len(df), dtype=float),
+        where=tv_prev_current.abs() > 1e-9,
+    )
+    ratio_series = pd.Series(ratio, index=df.index)
+
+    if "derivative_mask" in locals():
+        non_derivative_mask = ~derivative_mask
+    elif "futures_mask" in locals():
+        non_derivative_mask = ~futures_mask
+    else:
+        non_derivative_mask = pd.Series(True, index=df.index)
+
+ 
+
+    def _find_column(candidates: Iterable[str]) -> str | None:
+        for candidate in candidates:
+            simplified = _normalise_column_name(candidate)
+            if simplified in normalised_cols:
+                return normalised_cols[simplified]
+        return None
+
+    def _store_delta(values: pd.Series, target: str, *aliases: str) -> None:
+        df[target] = values
+        for alias in aliases:
+            if alias and alias in df.columns:
+                df[alias] = values
+
+    fx_col = _find_column(["FX_delta", "FXDelta", "FX Delta"])
+    if fx_col is not None:
+        fx_base = pd.to_numeric(df[fx_col], errors="coerce").fillna(0.0)
+        fx_updated = fx_base.copy()
+        fx_updated.loc[non_derivative_mask] = (
+            fx_base.loc[non_derivative_mask] * ratio_series.loc[non_derivative_mask]
+        )
+        _store_delta(fx_updated, "FXDelta", fx_col)
+
+    equity_col = _find_column(["Equity_delta", "EquityDelta", "Equity Delta"])
+    if equity_col is not None:
+        equity_base = pd.to_numeric(df[equity_col], errors="coerce").fillna(0.0)
+        equity_updated = equity_base.copy()
+        equity_updated.loc[non_derivative_mask] = (
+            equity_base.loc[non_derivative_mask]
+            * ratio_series.loc[non_derivative_mask]
+        )
+        _store_delta(equity_updated, "EquityDelta", equity_col)
+
+    duration_col = _find_column([
+        "Duration",
+    ])
+    if duration_col is not None:
+        duration_series = pd.to_numeric(df[duration_col], errors="coerce").fillna(0.0)
+        rate_alias = _find_column(["Rate_delta", "RateDelta", "RateDelta1bp"])
+        rate_source = rate_alias if rate_alias is not None else "Rate_delta"
+        existing_rate = pd.to_numeric(
+            df.get(rate_source, pd.Series(0.0, index=df.index)), errors="coerce"
+        )
+        if not isinstance(existing_rate, pd.Series):
+            existing_rate = pd.Series(existing_rate, index=df.index)
+        existing_rate = existing_rate.reindex(df.index).fillna(0.0)
+        rate_delta = existing_rate.copy()
+        computed_rate = duration_series * tv_series / 10000 * -1
+    
+        rate_delta.loc[non_derivative_mask] = computed_rate.loc[non_derivative_mask]
+        _store_delta(rate_delta, "RateDelta1bp", rate_alias)
+
+    spread_duration_col = _find_column([
+        "SpreadDuration",
+        "DurationSpread",
+        "Spread_Duration",
+    ])
+    if spread_duration_col is not None:
+        spread_duration_series = pd.to_numeric(
+            df[spread_duration_col], errors="coerce"
+        ).fillna(0.0)
+        credit_alias = _find_column(["Credit_delta", "CreditDelta", "SpreadDelta1bp"])
+        credit_source = credit_alias if credit_alias is not None else "Credit_delta"
+        existing_credit = pd.to_numeric(
+            df.get(credit_source, pd.Series(0.0, index=df.index)), errors="coerce"
+        )
+        if not isinstance(existing_credit, pd.Series):
+            existing_credit = pd.Series(existing_credit, index=df.index)
+        existing_credit = existing_credit.reindex(df.index).fillna(0.0)
+        credit_delta = existing_credit.copy()
+        computed_credit = spread_duration_series * tv_series / 10000 * -1
+        
+        credit_delta.loc[non_derivative_mask] = computed_credit.loc[non_derivative_mask]
+        _store_delta(credit_delta, "SpreadDelta1bp", credit_alias)
+
     history_path = config.collateral_history_path
     if history_path.exists():
         existing_history = pd.read_excel(history_path)
@@ -886,6 +1458,10 @@ def process_pv_after_day_1(
         "Futures_couverts_par_fonds",
         "Futures_couverts_par_cash",
         "Futures_couverts_par_obligations",
+        "Options_augmentent_cash",
+        "Options_couverts_par_fonds",
+        "Options_couverts_par_cash",
+        "Options_couverts_par_obligations",
         "Cash_initial",
         "Cash_disponible",
         "Cash_utilise",
