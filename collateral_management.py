@@ -15,8 +15,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Tuple
-
+from typing import Callable, Iterable, Mapping, Sequence, Tuple, Any
+import sys 
+import inspect
 import numpy as np
 import pandas as pd
 import re
@@ -113,17 +114,92 @@ def _normalise_column_name(name: str) -> str:
     return normalized
 
 
+def _sanitise_snapshot_label(label: str | None) -> str:
+    """Return a filesystem-friendly representation of a snapshot label."""
+
+    if label is None:
+        return ""
+    text = str(label).strip()
+    if not text:
+        return ""
+    sanitized = re.sub(r"[^0-9A-Za-z]+", "_", text.strip()).strip("_")
+    return sanitized.lower()
+
+
+def _write_collateral_frame(df: pd.DataFrame, path: Path) -> None:
+    """Persist a collateral dataframe following the destination format."""
+
+    suffix = path.suffix.lower()
+    if suffix in {".xlsx", ".xls", ".xlsm"}:
+        df.to_excel(path, index=False)
+    elif suffix == ".csv":
+        print(path)
+        df.to_csv(path, index=False, sep=";", decimal=",", encoding="latin1")
+    else:
+        df.to_csv(path, index=False)
+        
+def _deduplicate_columns(
+    df: pd.DataFrame,
+    canonical_name: str,
+) -> pd.DataFrame:
+    """Ensure there is at most one column matching ``canonical_name``."""
+
+    normalised_target = _normalise_column_name(canonical_name)
+    matching_columns = [
+        col for col in df.columns if _normalise_column_name(col) == normalised_target
+    ]
+    if not matching_columns:
+        return df
+
+    keep = canonical_name if canonical_name in matching_columns else matching_columns[0]
+    if keep != canonical_name:
+        df = df.rename(columns={keep: canonical_name})
+        keep = canonical_name
+
+    for col in matching_columns:
+        if col == keep:
+            continue
+        if col in df.columns:
+            df = df.drop(columns=col)
+    return df
+
+def _normalise_balance_columns(
+    df: pd.DataFrame,
+    config: CollateralConfig,
+) -> pd.DataFrame:
+    """Return a copy where balance columns use their canonical names."""
+
+    frame = df
+    frame = _deduplicate_columns(frame, "Balance_J")
+    frame = _deduplicate_columns(frame, config.balance_prev_col)
+    return frame
+
 def _load_collateral_inputs(config: CollateralConfig) -> pd.DataFrame:
     """Load the collateral instructions for each counterparty/portfolio."""
 
     path = config.collateral_input_path
     if path.exists():
-        inputs = pd.read_csv(path, sep=';',decimal=',',encoding='latin1')
-        inputs=inputs.rename(columns={
-        "Code portefeuille": "Portfolio",
-        "Contrepartie": "Counterparty"
-   
-    })
+        suffix = path.suffix.lower()
+        if suffix in {".xlsx", ".xls", ".xlsm"}:
+            inputs = pd.read_excel(path)
+        else:
+            read_kwargs = {"sep": ";", "decimal": ",", "encoding": "latin1"}
+            try:
+                inputs = pd.read_csv(path, **read_kwargs)
+            except pd.errors.ParserError:
+                fallback_kwargs = {**read_kwargs, "sep": None, "engine": "python"}
+                try:
+                    inputs = pd.read_csv(path, **fallback_kwargs)
+                except Exception as exc:  # pragma: no cover - safety net for unexpected formats
+                    raise RuntimeError(
+                        f"Unable to read collateral input file at '{path}'."
+                    ) from exc
+        inputs = inputs.rename(
+            columns={
+                "Code portefeuille": "Portfolio",
+                "Contrepartie": "Counterparty",
+            }
+        )
     else:
         inputs = pd.DataFrame(
             columns=[
@@ -264,7 +340,9 @@ def process_pv_after_day_1(
         "FX Option",
     ),
     cash_identifier: str = "CSH_EUR_DB",
+    history_day_label: str | None = None,
     config: CollateralConfig | None = None,
+    collateral_inputs: pd.DataFrame | None = None,
     history_date: str | pd.Timestamp | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Aggregate Day‑1 PVs and manage collateral balances.
@@ -304,7 +382,7 @@ def process_pv_after_day_1(
         Updated exposures, futures TV sums, pre-collateral balances,
         collateral decisions dataframe and a table containing the alerts.
     """
-
+    print(config)
     if config is None:
         config = CollateralConfig()
     config.ensure_directories()
@@ -549,7 +627,11 @@ def process_pv_after_day_1(
     balances = cp_port_tv.rename(columns={"TV_before_collat": "Balance_J"})
     
 
-    inputs = _load_collateral_inputs(config)
+    if collateral_inputs is None:
+        inputs = _load_collateral_inputs(config)
+    else:
+        inputs = _normalise_balance_columns(collateral_inputs.copy(), config)
+
 
     mask_perimeter = inputs['Portfolio'].isin(balances['Portfolio'].unique())
     inputs = inputs.loc[mask_perimeter]
@@ -1128,6 +1210,8 @@ def process_pv_after_day_1(
         return portfolio_nav_map.get(key)
 
     usage_records: list[dict[str, object]] = []
+    day_label_value = history_day_label if history_day_label is not None else np.nan
+
     for (portfolio_key, asset_label), usage in fund_usage_by_key.items():
         total_used = float(usage.get("total", 0.0))
         cash_deficit_used = float(usage.get("cash_deficit", 0.0))
@@ -1163,6 +1247,7 @@ def process_pv_after_day_1(
         usage_records.append(
             {
                 "Date": history_dt,
+                "Jour": day_label_value,
                 "Portefeuille": portfolio_key if portfolio_key is not None else np.nan,
                 "Fonds_monetaires": asset_label,
                 "Montant_vendu": amount_signed,
@@ -1182,6 +1267,7 @@ def process_pv_after_day_1(
     usage_path = config.monetary_fund_usage_history_path
     usage_columns = [
         "Date",
+        "Jour",
         "Portefeuille",
         "Fonds_monetaires",
         "Montant_vendu",
@@ -1214,16 +1300,16 @@ def process_pv_after_day_1(
 
     usage_df = pd.DataFrame(usage_records, columns=usage_columns)
     if not existing_usage.empty:
-        existing_usage = existing_usage.reindex(columns=usage_columns)
-        usage_df = pd.concat([existing_usage, usage_df], ignore_index=True, sort=False)
-
-    if not existing_usage.empty:
+        missing_cols = [col for col in usage_columns if col not in existing_usage.columns]
+        if missing_cols:
+            for col in missing_cols:
+                existing_usage[col] = np.nan
         existing_usage = existing_usage.reindex(columns=usage_columns)
         usage_df = pd.concat([existing_usage, usage_df], ignore_index=True, sort=False)
 
     if not usage_df.empty:
         usage_df = usage_df.sort_values(
-            ["Portefeuille", "Fonds_monetaires", "Date"], ignore_index=True
+            ["Portefeuille", "Fonds_monetaires", "Date", "Jour"], ignore_index=True
         )
 
         numeric_cols = [
@@ -1478,6 +1564,9 @@ def process_pv_after_day_1(
 def roll_balance_for_next_day(
     processed_collateral: pd.DataFrame,
     config: CollateralConfig | None = None,
+    current_inputs: pd.DataFrame | None = None,
+    snapshot_label: str | None = None,
+    snapshot_directory: Path | None = None
 ) -> pd.DataFrame:
     """Update the collateral input so that ``Balance_J_1`` = ``Balance_J``.
 
@@ -1513,7 +1602,13 @@ def roll_balance_for_next_day(
             + ", ".join(sorted(missing))
         )
 
-    inputs = _load_collateral_inputs(config)
+    if current_inputs is None:
+        inputs = _load_collateral_inputs(config)
+    else:
+        inputs = _normalise_balance_columns(current_inputs.copy(), config)
+
+    inputs = _normalise_balance_columns(inputs, config)
+
 
     update_cols = [config.portfolio_col, config.counterparty_col, "Balance_J"]
 
@@ -1525,16 +1620,295 @@ def roll_balance_for_next_day(
         how="outer",
         suffixes=("", "_new"),
     )
-    refreshed[config.balance_prev_col] = refreshed["Balance_J_new"].combine_first(
+    if "Balance_J_new" in refreshed.columns:
+        new_balance = refreshed["Balance_J_new"]
+    else:
+        new_balance = refreshed["Balance_J"]
+
+    refreshed[config.balance_prev_col] = new_balance.combine_first(
+
         refreshed.get(config.balance_prev_col, pd.Series(dtype=float))
     )
 
     refreshed = refreshed.drop(columns=[col for col in refreshed.columns if col.endswith("_new")])
+    refreshed = _normalise_balance_columns(refreshed, config)
 
-    refreshed.to_excel(config.collateral_input_path, index=False)
+
+    target_path = config.collateral_input_path
+    #_write_collateral_frame(refreshed, target_path)
+
+    snapshot_path: Path | None = None
+    snapshot_slug = _sanitise_snapshot_label(snapshot_label)
+    if snapshot_slug:
+        snapshot_dir = snapshot_directory or target_path.parent
+        if snapshot_dir:
+            Path(snapshot_dir).mkdir(parents=True, exist_ok=True)
+        snapshot_path = Path(snapshot_dir) / f"{target_path.stem}_{snapshot_slug}{target_path.suffix}"
+        _write_collateral_frame(refreshed, snapshot_path)
+
+    refreshed.attrs["input_path"] = target_path
+    refreshed.attrs["snapshot_path"] = snapshot_path
     return refreshed
 
+def run_stress_sequence(
+    exposures: pd.DataFrame,
+    merged_mapping: pd.DataFrame,
+    day_columns: Sequence[str],
+    *,
+    day_step_apply_func: Callable[..., tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]] | None = None,
+    day_step_kwargs: Mapping[str, Any] | None = None,
+    process_kwargs: Mapping[str, Any] | None = None,
+    history_dates: Sequence[str | pd.Timestamp | None] | None = None,
+    history_day_labels: Sequence[str | None] | None = None,
+    update_collateral_inputs: bool = True,
+    snapshot_collateral_inputs: bool = True,
+    collateral_snapshot_directory: Path | None = None,
+) -> list[dict[str, Any]]:
+    """Apply stress scenarios sequentially while managing collateral.
 
+    Parameters
+    ----------
+    exposures:
+        DataFrame containing the starting exposures (typically Day‑1
+        results).
+    merged_mapping:
+        Output of :func:`merge_pos_scen` linking the position mapping to
+        the scenario table.
+    day_columns:
+        Ordered list of scenario columns (``"Day 1"``, ``"Day 2"`` …)
+        that will be fed into ``day_step_apply``.
+    day_step_apply_func:
+        Callable compatible with :func:`day_step_apply`.  When omitted the
+        function attempts to reuse the helper defined in the calling
+        environment (for example a notebook where ``day_step_apply`` has
+        already been declared).
+    day_step_kwargs:
+        Additional keyword arguments forwarded to ``day_step_apply`` at
+        each iteration.
+    process_kwargs:
+        Keyword arguments forwarded to :func:`process_pv_after_day_1`
+        (``config``, ``future_classes`` …).
+    history_dates:
+        Optional sequence of dates associated with each day.  Missing
+        entries fallback to ``None`` which triggers ``process_pv_after_day_1``
+        default behaviour.
+    history_day_labels:
+        Optional textual labels (``"Day 1"`` …) mirrored into the
+        monetary fund usage history.
+    update_collateral_inputs:
+        When ``True`` the helper calls :func:`roll_balance_for_next_day`
+        to refresh the collateral input file after each day.
+
+    Returns
+    -------
+    list[dict[str, Any]]
+        A list containing the detailed artefacts for each processed day:
+        deterministic results, per-identifier pivots, exposures before and
+        after collateral processing, collateral decisions, alerts, the
+        refreshed collateral input and, when available, the filesystem paths
+        of both the overwritten base collateral file and the day-labelled
+        snapshot.
+    """
+    print(process_kwargs)
+
+    if day_step_apply_func is None:
+        potential = globals().get("day_step_apply")
+        if potential is None:
+            main_module = sys.modules.get("__main__")
+            if main_module is not None:
+                potential = getattr(main_module, "day_step_apply", None)
+        if potential is None:
+            stack = inspect.stack()
+            try:
+                for frame_info in stack:
+                    candidate = frame_info.frame.f_locals.get("day_step_apply")
+                    if callable(candidate):
+                        potential = candidate
+                        break
+                # Explicitly drop references held by FrameInfo objects.
+                for frame_info in stack:
+                    del frame_info
+                frame_info = None
+            finally:
+                del stack
+        if potential is None:
+            raise ValueError(
+                "day_step_apply_func must be provided when the helper is not defined "
+                "in the current namespace."
+            )
+        day_step_apply_func = potential
+
+    def _normalise_liquidity_column(frame: pd.DataFrame | None) -> pd.DataFrame | None:
+        """Ensure the LiquidityScore information lives in a single column."""
+
+        if frame is None:
+            return None
+
+        if "LiquidityScore" in frame.columns and not any(
+            col.startswith("LiquidityScore") and col.endswith(("_x", "_y"))
+            for col in frame.columns
+        ):
+            return frame
+
+        frame = frame.copy()
+
+        candidates = []
+        for name in ("LiquidityScore", "LiquidityScore_x", "LiquidityScore_y"):
+            if name in frame.columns:
+                candidates.append(pd.to_numeric(frame[name], errors="coerce"))
+
+        if candidates:
+            consolidated = candidates[0]
+            for extra in candidates[1:]:
+                consolidated = consolidated.combine_first(extra)
+            frame["LiquidityScore"] = consolidated
+
+        for redundant in ("LiquidityScore_x", "LiquidityScore_y"):
+            if redundant in frame.columns:
+                frame = frame.drop(columns=redundant)
+
+        return frame
+    results: list[dict[str, Any]] = []
+    exposures_current = _normalise_liquidity_column(exposures.copy())
+    base_day_kwargs = dict(day_step_kwargs or {})
+    base_process_kwargs = dict(process_kwargs or {})
+    collateral_inputs_current = base_process_kwargs.pop("collateral_inputs", None)
+
+    liquidity_col = "LiquidityScore"
+    key_col = base_day_kwargs.get("key_col") if base_day_kwargs else None
+    if key_col is None:
+        for candidate in ("Identifier", "identifier", "ID", "Id"):
+            if candidate in exposures_current.columns:
+                key_col = candidate
+                break
+
+    liquidity_lookup: pd.Series | None = None
+    if (
+        key_col is not None
+        and key_col in exposures_current.columns
+        and liquidity_col in exposures_current.columns
+    ):
+        base_lookup = (
+            exposures_current[[key_col, liquidity_col]]
+            .dropna(subset=[key_col])
+            .drop_duplicates(subset=[key_col], keep="last")
+            .set_index(key_col)[liquidity_col]
+        )
+        liquidity_lookup = base_lookup
+    for idx, day_col in enumerate(day_columns, start=1):
+        day_kwargs = dict(base_day_kwargs)
+        day_kwargs["exposures"] = _normalise_liquidity_column(exposures_current)
+        day_kwargs["merged_mapping"] = merged_mapping
+        day_kwargs["day_col"] = day_col
+        day_kwargs.setdefault("return_pivot", True)
+
+        deterministic_df, per_id_df, exposures_next = day_step_apply_func(**day_kwargs)
+        if (
+            liquidity_lookup is not None
+            and key_col is not None
+            and key_col in exposures_next.columns
+        ):
+            exposures_next = _normalise_liquidity_column(exposures_next)
+            if liquidity_col in exposures_next.columns:
+                missing_liquidity = exposures_next[liquidity_col].isna()
+                if missing_liquidity.any():
+                    exposures_next.loc[missing_liquidity, liquidity_col] = (
+                        exposures_next.loc[missing_liquidity, key_col]
+                        .map(liquidity_lookup)
+                        .values
+                    )
+            else:
+                exposures_next[liquidity_col] = (
+                    exposures_next[key_col].map(liquidity_lookup).values
+                )
+
+        history_date = None
+        if history_dates is not None and idx - 1 < len(history_dates):
+            history_date = history_dates[idx - 1]
+
+        if history_day_labels is not None and idx - 1 < len(history_day_labels):
+            day_label = history_day_labels[idx - 1]
+        else:
+            day_label = f"Day {idx}"
+
+        process_args = dict(base_process_kwargs)
+        process_args.setdefault("history_date", history_date)
+        process_args["history_day_label"] = day_label
+        process_args["collateral_inputs"] = collateral_inputs_current
+
+
+        updated_exp, futures_tv, balances, decisions, alerts = process_pv_after_day_1(
+            exposures_next, **process_args
+        )
+
+        refreshed_inputs = None
+        snapshot_path = None
+        input_path = None
+
+        if update_collateral_inputs:
+            config_obj = process_args.get("config")
+            refreshed_inputs = roll_balance_for_next_day(
+                decisions,
+                config=config_obj,
+                current_inputs=collateral_inputs_current,
+                snapshot_label=day_label if snapshot_collateral_inputs else None,
+                snapshot_directory=collateral_snapshot_directory,
+            )
+            collateral_inputs_current = refreshed_inputs
+            if hasattr(refreshed_inputs, "attrs"):
+                snapshot_path = refreshed_inputs.attrs.get("snapshot_path")
+                input_path = refreshed_inputs.attrs.get("input_path")
+        else:
+            collateral_inputs_current = process_args.get("collateral_inputs")
+            if hasattr(collateral_inputs_current, "attrs"):
+                snapshot_path = collateral_inputs_current.attrs.get("snapshot_path")
+                input_path = collateral_inputs_current.attrs.get("input_path")
+            
+
+        results.append(
+            {
+                "day_index": idx,
+                "day_column": day_col,
+                "day_label": day_label,
+                "deterministic": deterministic_df,
+                "per_identifier": per_id_df,
+                "exposures": updated_exp,
+                "futures_tv": futures_tv,
+                "balances": balances,
+                "decisions": decisions,
+                "alerts": alerts,
+                "collateral_input": refreshed_inputs,
+                "collateral_input_path": input_path,
+                "collateral_snapshot_path": snapshot_path,
+            }
+        )
+
+        exposures_current = _normalise_liquidity_column(updated_exp.copy())
+        if (
+            liquidity_lookup is not None
+            and key_col is not None
+            and key_col in exposures_current.columns
+            and liquidity_col in exposures_current.columns
+        ):
+            fresh_lookup = (
+                exposures_current[[key_col, liquidity_col]]
+                .dropna(subset=[key_col])
+                .drop_duplicates(subset=[key_col], keep="last")
+                .set_index(key_col)[liquidity_col]
+            )
+            liquidity_lookup = liquidity_lookup.combine_first(fresh_lookup)
+        elif (
+            key_col is not None
+            and key_col in exposures_current.columns
+            and liquidity_col in exposures_current.columns
+        ):
+            liquidity_lookup = (
+                exposures_current[[key_col, liquidity_col]]
+                .dropna(subset=[key_col])
+                .drop_duplicates(subset=[key_col], keep="last")
+                .set_index(key_col)[liquidity_col]
+            )
+    return results
 # Backwards compatibility with the previous naming convention used in the
 # notebook.
 process_pv_after_day1 = process_pv_after_day_1
@@ -1543,4 +1917,5 @@ __all__ = [
     "CollateralConfig",
     "process_pv_after_day_1",
     "process_pv_after_day1",
-    "roll_balance_for_next_day"]
+    "roll_balance_for_next_day",
+    "run_stress_sequence"]
