@@ -518,6 +518,7 @@ def _consume_ranked_assets(
     return consumed
 
 
+
 def process_pv_after_day_1(
     exposures_next: pd.DataFrame,
     future_classes: Iterable[str] | Tuple[str, ...] = (
@@ -796,10 +797,7 @@ def process_pv_after_day_1(
             if not np.isfinite(liquidity_score):
                 continue
             liquidity_score = float(liquidity_score)
-            if (
-                abs(liquidity_score - 9.0) > 1e-9
-                and abs(liquidity_score - 10.0) > 1e-9
-            ):
+            if ( abs(liquidity_score - 9.0) > 1e-9 and abs(liquidity_score - 10.0) > 1e-9 ) and abs(liquidity_score - 8.0) >1e-9:
                 continue
             portfolio_value = df.at[idx, config.portfolio_col]
             key = portfolio_value if pd.notna(portfolio_value) else None
@@ -810,7 +808,6 @@ def process_pv_after_day_1(
             bond_remaining_by_portfolio[key] = (
                 bond_remaining_by_portfolio.get(key, 0.0) + float(tv_value)
             )
-
         for key, entries in list(bond_indices_by_portfolio.items()):
             entries.sort(
                 key=lambda item: (-item[0], -float(df.at[item[1], "TV"]))
@@ -909,6 +906,7 @@ def process_pv_after_day_1(
     merged["Liability_couverts_par_fonds"] = 0.0
     merged["Liability_couverts_par_cash"] = 0.0
     merged["Liability_couverts_par_obligations"] = 0.0
+    merged["Liability_augmentent_cash"] = 0.0
     merged["Alerte"] = pd.Series([np.nan] * len(merged), dtype="object")
 
     groupama_mask = (~merged["Seuil_respecte"]) & (merged["Variation"] < 0)
@@ -962,8 +960,9 @@ def process_pv_after_day_1(
                     cash_adjustments_by_portfolio.get(key, 0.0) + converted
                 )
 
+        liability_cash_credit = 0.0
         def _apply_liability_shock() -> tuple[float, float, float, float, str | None]:
-            nonlocal available_cash_pool, fund_pool, bond_pool, total_used
+            nonlocal available_cash_pool, fund_pool, bond_pool, total_used, liability_cash_credit
 
             if liability_lookup is None or liability_day_key is None:
                 return 0.0, 0.0, 0.0, 0.0, None
@@ -1001,26 +1000,26 @@ def process_pv_after_day_1(
                 return 0.0, 0.0, 0.0, 0.0, None
 
             amount = -pct_value * nav_total / 100.0
-            if amount <= 1e-9:
+            if abs(amount) <= 1e-9:
                 return 0.0, 0.0, 0.0, 0.0, None
+            
+            if amount < -1e-9:
+                cash_credit = -amount
+                available_cash_pool += cash_credit
+                liability_cash_credit += cash_credit
+                cash_adjustments_by_portfolio[key] = (
+                    cash_adjustments_by_portfolio.get(key, 0.0) + cash_credit
+                )
+                return amount, 0.0, 0.0, 0.0, None
 
             remaining = float(amount)
             liability_fund_used = 0.0
             liability_cash_used = 0.0
             liability_bond_used = 0.0
 
-            if fund_pool > 1e-9 and fund_indices:
-                snapshot_before = _snapshot_fund_tv(fund_indices)
-                consumed = _consume_monetary_funds(
-                    df, fund_indices, min(remaining, fund_pool)
-                )
-                if consumed > 0.0:
-                    fund_pool = max(fund_pool - consumed, 0.0)
-                    remaining = max(remaining - consumed, 0.0)
-                    liability_fund_used = consumed
-                    _record_monetary_usage(snapshot_before, "liability")
+            
 
-            if remaining > 1e-9 and available_cash_pool > 0.0:
+            if available_cash_pool > 0.0:
                 cash_consumed = min(remaining, available_cash_pool)
                 if cash_consumed > 0.0:
                     available_cash_pool = max(available_cash_pool - cash_consumed, 0.0)
@@ -1030,6 +1029,15 @@ def process_pv_after_day_1(
                     cash_adjustments_by_portfolio[key] = (
                         cash_adjustments_by_portfolio.get(key, 0.0) - cash_consumed
                     )
+
+            if remaining > 1e-9 and fund_pool > 1e-9 and fund_indices:
+                snapshot_before = _snapshot_fund_tv(fund_indices)
+                consumed = _consume_monetary_funds(df, fund_indices, min(remaining, fund_pool))
+                if consumed > 0.0: 
+                    fund_pool = max(fund_pool - consumed, 0.0)
+                    remaining = max(remaining - consumed, 0.0)
+                    liability_fund_used = consumed
+                    _record_monetary_usage(snapshot_before, "liability")
 
             if remaining > 1e-9 and bond_pool > 1e-9 and bond_indices:
                 consumed_bonds = _consume_ranked_assets(df, bond_indices, remaining)
@@ -1041,6 +1049,7 @@ def process_pv_after_day_1(
             alert = None
             if remaining > 1e-9:
                 alert = _format_alert(remaining, reason="liability")
+                print(alert)
 
             return amount, liability_fund_used, liability_cash_used, liability_bond_used, alert
 
@@ -1048,6 +1057,7 @@ def process_pv_after_day_1(
             cash_deficit_alert = _format_alert(
                 -available_cash_pool, reason="cash initial"
             )
+            print(cash_deficit_alert)
             available_cash_pool = 0.0
         elif available_cash_pool < 0:
             available_cash_pool = 0.0
@@ -1081,21 +1091,26 @@ def process_pv_after_day_1(
 
         if futures_effect < -1e-9:
             futures_need = -futures_effect
-            if fund_pool > 1e-9 and fund_indices:
+            if available_cash_pool > 0.0:
+                futures_cash_used = min(futures_need, available_cash_pool)
+                if futures_cash_used > 0.0:
+                    available_cash_pool = max(
+                        available_cash_pool - futures_cash_used, 0.0
+                    )
+                    futures_need = max(futures_need - futures_cash_used, 0.0)
+                    cash_adjustments_by_portfolio[key] = (
+                        cash_adjustments_by_portfolio.get(key, 0.0)
+                        - futures_cash_used
+                    )
+            if futures_need > 1e-9 and fund_pool > 1e-9 and fund_indices:
                 snapshot_before = _snapshot_fund_tv(fund_indices)
+
                 futures_fund_used = _consume_monetary_funds(df, fund_indices, futures_need)
                 if futures_fund_used > 0.0:
                     fund_pool = max(fund_pool - futures_fund_used, 0.0)
                     futures_need = max(futures_need - futures_fund_used, 0.0)
                     _record_monetary_usage(snapshot_before, "futures")
 
-            if futures_need > 1e-9 and available_cash_pool > 0.0:
-                futures_cash_used = min(futures_need, available_cash_pool)
-                available_cash_pool = max(available_cash_pool - futures_cash_used, 0.0)
-                futures_need = max(futures_need - futures_cash_used, 0.0)
-                cash_adjustments_by_portfolio[key] = (
-                    cash_adjustments_by_portfolio.get(key, 0.0) - futures_cash_used
-                )
             if futures_need > 1e-9 and bond_pool > 1e-9 and bond_indices:
                 futures_bond_used = _consume_ranked_assets(df, bond_indices, futures_need)
                 if futures_bond_used > 0.0:
@@ -1105,10 +1120,22 @@ def process_pv_after_day_1(
                     futures_shortfall_alert = _format_alert(
                     futures_need, reason="futures"
                 )
+                    print(futures_shortfall_alert)
 
         if options_effect < -1e-9:
             options_need = -options_effect
-            if fund_pool > 1e-9 and fund_indices:
+            if available_cash_pool > 0.0:
+                options_cash_used = min(options_need, available_cash_pool)
+                if options_cash_used > 0.0:
+                    available_cash_pool = max(
+                        available_cash_pool - options_cash_used, 0.0
+                    )
+                    options_need = max(options_need - options_cash_used, 0.0)
+                    cash_adjustments_by_portfolio[key] = (
+                        cash_adjustments_by_portfolio.get(key, 0.0)
+                        - options_cash_used
+                    )
+            if options_need > 1e-9 and fund_pool > 1e-9 and fund_indices:
                 snapshot_before = _snapshot_fund_tv(fund_indices)
                 options_fund_used = _consume_monetary_funds(df, fund_indices, options_need)
                 if options_fund_used > 0.0:
@@ -1116,13 +1143,6 @@ def process_pv_after_day_1(
                     options_need = max(options_need - options_fund_used, 0.0)
                     _record_monetary_usage(snapshot_before, "options")
 
-            if options_need > 1e-9 and available_cash_pool > 0.0:
-                options_cash_used = min(options_need, available_cash_pool)
-                available_cash_pool = max(available_cash_pool - options_cash_used, 0.0)
-                options_need = max(options_need - options_cash_used, 0.0)
-                cash_adjustments_by_portfolio[key] = (
-                    cash_adjustments_by_portfolio.get(key, 0.0) - options_cash_used
-                )
             if options_need > 1e-9 and bond_pool > 1e-9 and bond_indices:
                 options_bond_used = _consume_ranked_assets(df, bond_indices, options_need)
                 if options_bond_used > 0.0:
@@ -1132,6 +1152,7 @@ def process_pv_after_day_1(
                 options_shortfall_alert = _format_alert(
                     options_need, reason="options"
                 )
+                print(options_shortfall_alert)
 
         initial_cash = available_cash_pool + futures_cash_used + options_cash_used
         total_used = futures_cash_used + options_cash_used
@@ -1276,6 +1297,11 @@ def process_pv_after_day_1(
                         merged.at[first_idx, "Liability_couverts_par_obligations"]
                         + liability_bond_used
                     )
+                if liability_cash_credit:
+                    merged.at[first_idx, "Liability_augmentent_cash"] = (
+                        merged.at[first_idx, "Liability_augmentent_cash"] + liability_cash_credit
+                    )
+                    merged.at[first_idx, "Cash_restant"] = available_cash_pool
                 if liability_alert:
                     existing_alert = merged.at[first_idx, "Alerte"]
                     if pd.isna(existing_alert):
@@ -1300,31 +1326,6 @@ def process_pv_after_day_1(
                 continue
 
             required = max(float(-variation), 0.0)
-            fund_used = 0.0
-            if fund_pool > 1e-9:
-                fund_indices = monetary_indices_by_portfolio.get(key, [])
-                remaining_need = min(required, fund_pool)
-                while remaining_need > 1e-9 and fund_pool > 1e-9:
-                    snapshot_before = _snapshot_fund_tv(fund_indices)
-                    consumed = _consume_monetary_funds(df, fund_indices, remaining_need)
-                    
-                    if consumed <= 1e-9:
-                        break
-                    fund_used += consumed
-                    fund_pool = max(fund_pool - consumed, 0.0)
-                    required = max(required - consumed, 0.0)
-                    remaining_need = min(required, fund_pool)
-                    _record_monetary_usage(snapshot_before,"collateral")
-
-                if required > 1e-6 and fund_pool > 1e-6:
-                    raise ValueError(
-                        "Unable to fully consume monetary funds before using cash for "
-                        f"portfolio {portfolio!r}."
-                    )
-
-            merged.at[idx, "Fonds_monetaires_utilises"] = fund_used
-            merged.at[idx, "Fonds_monetaires_restant"] = fund_pool
-
             if available_cash_pool <= 0.0 or required <= 1e-9:
                 cash_used = 0.0
             else:
@@ -1339,6 +1340,25 @@ def process_pv_after_day_1(
                     cash_adjustments_by_portfolio.get(key, 0.0) - cash_used
                 )
             required = max(required - cash_used, 0.0)
+
+            fund_used = 0.0
+            if required > 1e-9 and fund_pool > 1e-9:
+                fund_indices = monetary_indices_by_portfolio.get(key, [])
+                remaining_need = min(required, fund_pool)
+                while remaining_need > 1e-9 and fund_pool > 1e-9:
+                    snapshot_before = _snapshot_fund_tv(fund_indices)
+                    consumed = _consume_monetary_funds(df, fund_indices, remaining_need)
+                    
+                    if consumed <= 1e-9:
+                        break
+                    fund_used += consumed
+                    fund_pool = max(fund_pool - consumed, 0.0)
+                    required = max(required - consumed, 0.0)
+                    remaining_need = min(required, fund_pool)
+                    _record_monetary_usage(snapshot_before,"collateral")
+
+            merged.at[idx, "Fonds_monetaires_utilises"] = fund_used
+            merged.at[idx, "Fonds_monetaires_restant"] = fund_pool
 
             bond_used = 0.0
             if required > 1e-9 and bond_pool > 1e-9 and bond_indices:
@@ -1355,6 +1375,8 @@ def process_pv_after_day_1(
                 merged.at[idx, "Alerte"] = _format_alert(
                     shortfall, reason="appel collateral"
                 )
+                print(merged.at[idx, "Alerte"])
+
 
             (
             liability_amount,
@@ -1365,9 +1387,11 @@ def process_pv_after_day_1(
         ) = _apply_liability_shock()
             
         merged.loc[portfolio_df.index, "Liability_total"] = liability_amount
+        merged.loc[portfolio_df.index, "Cash_restant"] = available_cash_pool
+
 
         if portfolio_df.index.size:
-            first_idx = portfolio_df.index[0]        
+            first_idx = portfolio_df.index[0]         
             if cash_deficit_fund_used:
                 merged.at[first_idx, "Fonds_monetaires_utilises"] = (
                     merged.at[first_idx, "Fonds_monetaires_utilises"] + cash_deficit_fund_used
@@ -1481,6 +1505,11 @@ def process_pv_after_day_1(
                     merged.at[first_idx, "Liability_couverts_par_obligations"]
                     + liability_bond_used
                 )
+            if liability_cash_credit:
+                merged.at[first_idx, "Liability_augmentent_cash"] = (
+                    merged.at[first_idx, "Liability_augmentent_cash"] + liability_cash_credit
+                )
+                merged.at[first_idx, "Cash_restant"] = available_cash_pool
             if liability_alert:
                 existing_alert = merged.at[first_idx, "Alerte"]
                 if pd.isna(existing_alert):
@@ -1860,24 +1889,6 @@ def process_pv_after_day_1(
             if alias and alias in df.columns:
                 df[alias] = values
 
-    fx_col = _find_column(["FX_delta", "FXDelta", "FX Delta"])
-    if fx_col is not None:
-        fx_base = pd.to_numeric(df[fx_col], errors="coerce").fillna(0.0)
-        fx_updated = fx_base.copy()
-        fx_updated.loc[non_derivative_mask] = (
-            fx_base.loc[non_derivative_mask] * ratio_series.loc[non_derivative_mask]
-        )
-        _store_delta(fx_updated, "FXDelta", fx_col)
-
-    equity_col = _find_column(["Equity_delta", "EquityDelta", "Equity Delta"])
-    if equity_col is not None:
-        equity_base = pd.to_numeric(df[equity_col], errors="coerce").fillna(0.0)
-        equity_updated = equity_base.copy()
-        equity_updated.loc[non_derivative_mask] = (
-            equity_base.loc[non_derivative_mask]
-            * ratio_series.loc[non_derivative_mask]
-        )
-        _store_delta(equity_updated, "EquityDelta", equity_col)
 
     duration_col = _find_column([
         "Duration",
@@ -1965,6 +1976,7 @@ def process_pv_after_day_1(
         "Liability_couverts_par_fonds",
         "Liability_couverts_par_cash",
         "Liability_couverts_par_obligations",
+        "Liability_augmentent_cash",
         "Cash_initial",
         "Cash_disponible",
         "Cash_utilise",
@@ -2068,6 +2080,424 @@ def roll_balance_for_next_day(
     refreshed.attrs["input_path"] = target_path
     refreshed.attrs["snapshot_path"] = snapshot_path
     return refreshed
+
+def export_perimeter_instrument_details(
+    sequence_results: Sequence[Mapping[str, Any]],
+    portfolios: Iterable[object],
+    output_path: str | Path,
+    *,
+    portfolio_col: str = "Portfolio",
+    identifier_col: str = "Identifier",
+    asset_class_col: str = "AssetClass",
+    per_identifier_tv_col: str = "TV",
+    per_identifier_stressed_col: str = "TV_after_stress",
+    post_tv_col: str = "TV",
+    pre_collateral_tv_col: str = "TV",
+    include_missing: bool = False,
+) -> pd.DataFrame:
+    """Export day-by-day instrument details for a list of portfolios.
+
+    The helper inspects the artefacts produced by
+    :func:`run_stress_sequence` and reconciles, for each identifier,
+    the TV before stress, the TV after applying the day's shock and the
+    closing TV once collateral-driven sales have been processed.  Stress
+    PnL is computed from the difference between the pre- and
+    post-stress values (``per_identifier`` snapshot) while sales reflect
+    the delta between the stressed TV and the post-collateral exposure.
+
+    Parameters
+    ----------
+    sequence_results:
+        Iterable of dictionaries emitted by :func:`run_stress_sequence`.
+        Each entry must expose ``per_identifier``,
+        ``pre_collateral_exposures`` and ``exposures`` dataframes.
+    portfolios:
+        Collection of portfolio identifiers defining the perimeter to
+        extract.  Identifiers are normalised with
+        :func:`_normalise_portfolio_value` so integers and textual
+        values can be mixed.
+    output_path:
+        Destination path for the exported table.  The helper writes
+        Excel files when ``output_path`` ends with ``.xlsx``/``.xlsm``/
+        ``.xls`` and falls back to CSV otherwise.  Parent directories are
+        created automatically.
+    portfolio_col / identifier_col / asset_class_col:
+        Column names used to identify the portfolio, instrument and
+        asset class in the provided dataframes.
+    per_identifier_tv_col / per_identifier_stressed_col:
+        Column names retrieved from the ``per_identifier`` dataframe to
+        compute the stress impact per instrument.
+    post_tv_col:
+        Name of the column containing the post-collateral TV in the
+        ``exposures`` dataframe.
+    pre_collateral_tv_col:
+        Column in ``pre_collateral_exposures`` reflecting the TV before
+        collateral actions.  It is used as a fallback when the
+        ``per_identifier`` snapshot is missing stressed values.
+    include_missing:
+        When ``True`` instruments with missing portfolio identifiers are
+        kept in the export; otherwise they are dropped.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Table with one row per instrument and per day exposing stress
+        PnL and collateral sales alongside the opening/closing TVs.
+    """
+
+    if not sequence_results:
+        raise ValueError("sequence_results must contain at least one entry")
+
+    if not portfolios:
+        raise ValueError("portfolios must contain at least one identifier")
+
+    normalised_targets = {
+        _normalise_portfolio_value(value)
+        for value in portfolios
+        if _normalise_portfolio_value(value) is not None
+    }
+
+    if not normalised_targets and not include_missing:
+        raise ValueError("portfolios must contain at least one valid identifier")
+
+    def _match_portfolio(series: pd.Series) -> pd.Series:
+        normalised = series.map(_normalise_portfolio_value)
+        mask = normalised.isin(normalised_targets)
+        if include_missing:
+            mask = mask | normalised.isna()
+        return mask
+
+    def _prepare_values(
+        frame: pd.DataFrame,
+        rename_map: Mapping[str, str],
+    ) -> pd.DataFrame:
+        if not isinstance(frame, pd.DataFrame):
+            raise TypeError("Expected a DataFrame in sequence_results entry")
+        if portfolio_col not in frame.columns:
+            raise KeyError(f"Column {portfolio_col!r} missing from dataframe")
+        if identifier_col not in frame.columns:
+            raise KeyError(f"Column {identifier_col!r} missing from dataframe")
+
+        subset = frame.loc[_match_portfolio(frame[portfolio_col])].copy()
+        if not include_missing:
+            subset = subset.loc[subset[identifier_col].notna()]
+
+        if subset.empty:
+            columns = [portfolio_col, identifier_col, *rename_map.values()]
+            return pd.DataFrame(columns=columns)
+
+        data = {
+            portfolio_col: subset[portfolio_col],
+            identifier_col: subset[identifier_col],
+        }
+        for source, target in rename_map.items():
+            if source not in subset.columns:
+                values = pd.Series(0.0, index=subset.index)
+            else:
+                values = pd.to_numeric(subset[source], errors="coerce").fillna(0.0)
+            data[target] = values
+
+        prepared = pd.DataFrame(data)
+        aggregated = (
+            prepared.groupby([portfolio_col, identifier_col], as_index=False)
+            .sum(numeric_only=True)
+        )
+        return aggregated
+
+    def _prepare_metadata(frame: pd.DataFrame) -> pd.DataFrame | None:
+        if not isinstance(frame, pd.DataFrame):
+            return None
+        if portfolio_col not in frame.columns or identifier_col not in frame.columns:
+            return None
+        if asset_class_col not in frame.columns:
+            return None
+        subset = frame.loc[_match_portfolio(frame[portfolio_col])].copy()
+        if not include_missing:
+            subset = subset.loc[subset[identifier_col].notna()]
+        if subset.empty:
+            return None
+        return (
+            subset[[portfolio_col, identifier_col, asset_class_col]]
+            .drop_duplicates(subset=[portfolio_col, identifier_col], keep="last")
+        )
+
+    records: list[pd.DataFrame] = []
+
+    for entry in sequence_results:
+        day_index = entry.get("day_index")
+        day_label = entry.get("day_label") or entry.get("day_column")
+        if day_label is None and day_index is not None:
+            day_label = f"Day {day_index}"
+
+        per_identifier_df = entry.get("per_identifier")
+        pre_collateral_df = entry.get("pre_collateral_exposures")
+        post_collateral_df = entry.get("exposures")
+
+        if per_identifier_df is None or pre_collateral_df is None or post_collateral_df is None:
+            raise KeyError(
+                "Each sequence entry must expose 'per_identifier', 'pre_collateral_exposures' and 'exposures'"
+            )
+
+        per_values = _prepare_values(
+            per_identifier_df,
+            {
+                per_identifier_tv_col: "TV_start",
+                per_identifier_stressed_col: "TV_pre_collateral",
+            },
+        )
+
+        post_values = _prepare_values(
+            post_collateral_df,
+            {post_tv_col: "TV_end_of_day"},
+        )
+
+
+        if per_values.empty and post_values.empty:
+            continue
+
+        details = per_values
+        if details.empty:
+            details = pd.DataFrame(columns=[portfolio_col, identifier_col])
+
+
+        details = details.merge(
+                post_values,
+                on=[portfolio_col, identifier_col],
+                how="outer",
+            )
+
+
+        for column in ("TV_start", "TV_pre_collateral", "TV_end_of_day"):
+            if column not in details.columns:
+                details[column] = 0.0
+            else:
+                details[column] = pd.to_numeric(details[column], errors="coerce").fillna(0.0)
+
+        metadata = _prepare_metadata(post_collateral_df)
+        if metadata is None:
+            metadata = _prepare_metadata(pre_collateral_df)
+        if metadata is not None:
+            details = details.merge(
+                metadata,
+                on=[portfolio_col, identifier_col],
+                how="left"
+            )
+
+        details["Stress_PnL"] = details["TV_pre_collateral"] - details["TV_start"]
+        details["Collateral_sales"] = details["TV_end_of_day"] - details["TV_pre_collateral"]
+
+        details["day_index"] = day_index
+        details["day_label"] = day_label
+
+        columns_order = [
+            "day_index",
+            "day_label",
+            portfolio_col,
+            identifier_col,
+        ]
+        if asset_class_col in details.columns:
+            columns_order.append(asset_class_col)
+        columns_order.extend(
+            [
+                "TV_start",
+                "TV_pre_collateral",
+                "TV_end_of_day",
+                "Stress_PnL",
+                "Collateral_sales",
+            ]
+        )
+
+        details = details.reindex(columns=columns_order)
+
+        records.append(details)
+
+    if not records:
+        summary = pd.DataFrame(
+            columns=[
+                "day_index",
+                "day_label",
+                portfolio_col,
+                identifier_col,
+                asset_class_col,
+                "TV_start",
+                "TV_pre_collateral",
+                "TV_end_of_day",
+                "Stress_PnL",
+                "Collateral_sales",
+            ]
+        )
+    else:
+        summary = pd.concat(records, ignore_index=True)
+
+    if not summary.empty:
+        sort_cols = [col for col in ("day_index", "day_label", portfolio_col, identifier_col) if col in summary.columns]
+        if sort_cols:
+            summary = summary.sort_values(sort_cols).reset_index(drop=True)
+
+    output_path = Path(output_path)
+    if output_path.parent and output_path.parent != Path(""):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    suffix = output_path.suffix.lower()
+    if suffix in {".xlsx", ".xlsm", ".xls"}:
+        summary.to_excel(output_path, index=False)
+    else:
+        summary.to_csv(output_path, index=False)
+
+    return summary
+
+
+def export_perimeter_holdings_summary(
+    sequence_results: Sequence[Mapping[str, Any]],
+    portfolios: Iterable[object],
+    output_path: str | Path,
+    *,
+    portfolio_col: str = "Portfolio",
+    tv_col: str = "TV",
+    funds_column: str = "Fonds_monetaires_utilises",
+    bonds_column: str = "Obligations_liquides_utilisees",
+    cash_column: str = "Cash_utilise",
+) -> pd.DataFrame:
+    """Aggregate holdings and sales for a perimeter across stress days.
+
+    Parameters
+    ----------
+    sequence_results:
+        Iterable of dictionaries returned by :func:`run_stress_sequence`.
+        Each entry must expose ``pre_collateral_exposures``, ``exposures`` and
+        ``decisions`` dataframes.
+    portfolios:
+        Collection of portfolio identifiers defining the perimeter to
+        aggregate.  Identifiers are normalised with
+        :func:`_normalise_portfolio_value` before comparison so integers and
+        textual values can be mixed.
+    output_path:
+        Destination path for the exported table.  The function automatically
+        creates parent directories and writes ``.xlsx`` files via
+        :meth:`pandas.DataFrame.to_excel` while other extensions default to CSV.
+    portfolio_col / tv_col:
+        Column names used to identify the portfolio and stressed TV values in
+        the exposure tables.  ``tv_col`` is summed to derive the holdings.
+    funds_column / bonds_column / cash_column:
+        Column names extracted from the collateral decisions to compute the
+        sales attributed to monetary funds, liquid bonds and cash usage.  When
+        a column is missing it is treated as zero.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Table with one row per stress day and the following columns: day index,
+        day label, holdings opening (post-stress, before collateral), sales by
+        pool and holdings end-of-day after the collateral actions.  The table is
+        also returned to the caller in addition to being written to
+        ``output_path``.
+    """
+
+    if not sequence_results:
+        raise ValueError("sequence_results must contain at least one entry")
+
+    normalised_targets: set[str] = set()
+    include_missing = False
+    for value in portfolios:
+        normalised = _normalise_portfolio_value(value)
+        if normalised is None:
+            include_missing = True
+        else:
+            normalised_targets.add(normalised)
+
+    if not normalised_targets and not include_missing:
+        raise ValueError("portfolios must contain at least one identifier")
+
+    def _match(series: pd.Series) -> pd.Series:
+        normalised = series.map(_normalise_portfolio_value)
+        mask = normalised.isin(normalised_targets)
+        if include_missing:
+            mask = mask | normalised.isna()
+        return mask
+
+    def _sum_series(series: pd.Series) -> float:
+        values = pd.to_numeric(series, errors="coerce")
+        if not isinstance(values, pd.Series):
+            values = pd.Series(values)
+        return float(values.sum(skipna=True))
+
+    records: list[dict[str, Any]] = []
+
+    for entry in sequence_results:
+        day_index = entry.get("day_index")
+        day_label = entry.get("day_label") or entry.get("day_column")
+        if day_label is None and day_index is not None:
+            day_label = f"Day {day_index}"
+
+        pre_df = entry.get("pre_collateral_exposures")
+        post_df = entry.get("exposures")
+        decisions_df = entry.get("decisions")
+
+        if not isinstance(pre_df, pd.DataFrame) or not isinstance(post_df, pd.DataFrame):
+            raise KeyError(
+                "Each sequence entry must provide 'pre_collateral_exposures' and 'exposures' dataframes"
+            )
+
+        for df_name, df in (("pre_collateral_exposures", pre_df), ("exposures", post_df)):
+            if portfolio_col not in df.columns:
+                raise KeyError(f"Column {portfolio_col!r} not found in {df_name} dataframe")
+            if tv_col not in df.columns:
+                raise KeyError(f"Column {tv_col!r} not found in {df_name} dataframe")
+
+        pre_subset = pre_df.loc[_match(pre_df[portfolio_col]), tv_col]
+        post_subset = post_df.loc[_match(post_df[portfolio_col]), tv_col]
+
+        holdings_opening = _sum_series(pre_subset)
+        holdings_end = _sum_series(post_subset)
+
+        sales_funds = sales_bonds = sales_cash = 0.0
+        if isinstance(decisions_df, pd.DataFrame):
+            if portfolio_col not in decisions_df.columns:
+                raise KeyError(
+                    f"Column {portfolio_col!r} not found in decisions dataframe"
+                )
+            mask = _match(decisions_df[portfolio_col])
+            relevant = decisions_df.loc[mask]
+            if not relevant.empty:
+                if funds_column in relevant.columns:
+                    sales_funds = _sum_series(relevant[funds_column])
+                if bonds_column in relevant.columns:
+                    sales_bonds = _sum_series(relevant[bonds_column])
+                if cash_column in relevant.columns:
+                    sales_cash = _sum_series(relevant[cash_column])
+
+        sales_total = sales_funds + sales_bonds + sales_cash
+
+        records.append(
+            {
+                "day_index": day_index,
+                "day_label": day_label,
+                "Holdings_opening": holdings_opening,
+                "Sales_fonds_monetaires": sales_funds,
+                "Sales_obligations_liquides": sales_bonds,
+                "Sales_cash": sales_cash,
+                "Sales_total": sales_total,
+                "Holdings_end_of_day": holdings_end,
+            }
+        )
+
+    summary = pd.DataFrame(records)
+    if not summary.empty:
+        sort_cols = [col for col in ("day_index", "day_label") if col in summary.columns]
+        if sort_cols:
+            summary = summary.sort_values(sort_cols).reset_index(drop=True)
+
+    output_path = Path(output_path)
+    if output_path.parent and output_path.parent != Path(""):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    suffix = output_path.suffix.lower()
+    if suffix in {".xlsx", ".xlsm", ".xls"}:
+        summary.to_excel(output_path, index=False)
+    else:
+        summary.to_csv(output_path, index=False)
+
+    return summary
 
 def run_stress_sequence(
     exposures: pd.DataFrame,
@@ -2220,6 +2650,7 @@ def run_stress_sequence(
         liquidity_lookup = base_lookup
 
     for idx, day_col in enumerate(day_columns, start=1):
+        print(day_col)
         day_kwargs = dict(base_day_kwargs)
         day_kwargs["exposures"] = _normalise_liquidity_column(exposures_current)
         day_kwargs["merged_mapping"] = merged_mapping
@@ -2344,9 +2775,11 @@ process_pv_after_day1 = process_pv_after_day_1
 __all__ = [
     "CollateralConfig",
     "process_pv_after_day_1",
+    "export_perimeter_holdings_summary",
     "process_pv_after_day1",
     "roll_balance_for_next_day",
     "LiabilityShockLookup",
     "build_liability_shock_lookup",
     "run_stress_sequence", 
-     "summarise_portfolio_sequence"]
+     "summarise_portfolio_sequence",
+     "export_perimeter_instrument_details"]
